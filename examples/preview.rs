@@ -20,6 +20,8 @@ use ratatui::Terminal;
 
 const ASPNET: &[u8] = include_bytes!("../tests/fixtures/aspnet-net9.nettrace");
 const GENERIC: &[u8] = include_bytes!("../tests/fixtures/generic-net10.nettrace");
+const LOADED: &[u8] = include_bytes!("../tests/fixtures/aspnet-net10-loaded.nettrace");
+const CONSOLE: &[u8] = include_bytes!("../tests/fixtures/console-net8.nettrace");
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut args = std::env::args().skip(1);
@@ -29,6 +31,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let (fixture, name, version) = match which.as_str() {
         "generic" => (GENERIC, "Rider.Backend", "10.0.1"),
+        "loaded" => (LOADED, "CounterCowSampleApi", "10.0.1"),
+        "console" => (CONSOLE, "CounterCowSampleConsole", "8.0.19"),
         _ => (ASPNET, "CrimeRate.VectorTileApi", "9.0.7"),
     };
 

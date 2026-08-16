@@ -162,10 +162,12 @@ fn render_gc_section(frame: &mut Frame, area: Rect, app: &App, theme: &Theme) {
 }
 
 fn render_aspnet_body(frame: &mut Frame, area: Rect, app: &App, theme: &Theme) {
+    // GC keeps the largest share; the runtime row gets just enough that its gauge survives on a
+    // normal-sized terminal.
     let [gc, requests, runtime] = Layout::vertical([
-        Constraint::Percentage(50),
-        Constraint::Percentage(28),
-        Constraint::Percentage(22),
+        Constraint::Percentage(48),
+        Constraint::Percentage(27),
+        Constraint::Percentage(25),
     ])
     .areas(area);
 

@@ -11,10 +11,23 @@ use std::collections::{BTreeSet, HashMap};
 use countercow::counters::sample::{self, CounterKind, CounterSample};
 use countercow::nettrace::blocks::NettraceParser;
 
-/// Captured from a net9.0 ASP.NET Core app under light load.
+/// Captured from an idle net9.0 ASP.NET Core app.
 const ASPNET_NET9: &[u8] = include_bytes!("fixtures/aspnet-net9.nettrace");
 /// Captured from a net10.0 non-ASP.NET process.
 const GENERIC_NET10: &[u8] = include_bytes!("fixtures/generic-net10.nettrace");
+/// Captured from `testapps/aspnet-sample` on net10.0 while under load, so the request and
+/// connection counters are non-zero.
+const ASPNET_NET10_LOADED: &[u8] = include_bytes!("fixtures/aspnet-net10-loaded.nettrace");
+/// Captured from `testapps/console-sample` on net8.0.
+const CONSOLE_NET8: &[u8] = include_bytes!("fixtures/console-net8.nettrace");
+
+/// Every fixture, for checks that should hold regardless of runtime version or app type.
+const ALL_FIXTURES: &[(&str, &[u8])] = &[
+    ("aspnet-net9", ASPNET_NET9),
+    ("generic-net10", GENERIC_NET10),
+    ("aspnet-net10-loaded", ASPNET_NET10_LOADED),
+    ("console-net8", CONSOLE_NET8),
+];
 
 struct Parsed {
     samples: Vec<CounterSample>,
@@ -213,12 +226,98 @@ fn samples_advance_over_time() {
 }
 
 #[test]
-fn net10_fixture_parses_with_the_same_code_path() {
-    // Metadata tag usage differs between runtime versions; this guards the V5 tag handling.
-    let parsed = parse(GENERIC_NET10);
-    assert!(parsed.metadata_count > 0);
-    assert!(!parsed.samples.is_empty());
-    assert!(parsed.samples.iter().any(|s| s.name == "cpu-usage"));
+fn every_runtime_version_parses_with_the_same_code_path() {
+    // Metadata tag usage differs between runtime versions; this guards the V5 tag handling
+    // across .NET 8, 9 and 10.
+    for (name, fixture) in ALL_FIXTURES {
+        let parsed = parse(fixture);
+        assert!(parsed.metadata_count > 0, "{name}: no metadata");
+        assert!(!parsed.samples.is_empty(), "{name}: no samples");
+        assert!(
+            parsed.samples.iter().any(|s| s.name == "cpu-usage"),
+            "{name}: System.Runtime counters missing"
+        );
+        assert_eq!(parsed.qpc_frequency, 1_000_000_000, "{name}");
+    }
+}
+
+#[test]
+fn the_core_runtime_counter_set_is_present_on_every_version() {
+    // Counters added in later runtimes are excluded; these have existed since .NET Core 3.
+    for (name, fixture) in ALL_FIXTURES {
+        let by_provider = names_by_provider(&parse(fixture));
+        let runtime = by_provider
+            .get("System.Runtime")
+            .unwrap_or_else(|| panic!("{name}: no System.Runtime counters"));
+
+        for expected in [
+            "cpu-usage",
+            "working-set",
+            "gc-heap-size",
+            "alloc-rate",
+            "exception-count",
+            "gen-0-size",
+            "assembly-count",
+            "threadpool-thread-count",
+        ] {
+            assert!(runtime.contains(expected), "{name}: missing {expected}");
+        }
+    }
+}
+
+#[test]
+fn a_loaded_app_reports_traffic_rather_than_zeroes() {
+    // The idle fixtures cannot distinguish "counter decoded as zero" from "counter decoded
+    // wrongly as zero". This one was captured under real load.
+    let parsed = parse(ASPNET_NET10_LOADED);
+
+    let requests = latest(&parsed, "requests-per-second");
+    assert_eq!(requests.provider, "Microsoft.AspNetCore.Hosting");
+    assert!(requests.value > 0.0, "expected traffic, got {}", requests.value);
+
+    assert!(latest(&parsed, "total-requests").value > 0.0);
+    assert!(latest(&parsed, "failed-requests").value > 0.0, "the /fail endpoint was hit");
+    assert!(latest(&parsed, "total-connections").value > 0.0);
+    assert!(latest(&parsed, "exception-count").value > 0.0, "the /throw endpoint was hit");
+    assert!(latest(&parsed, "alloc-rate").value > 0.0, "the /alloc endpoint was hit");
+}
+
+#[test]
+fn cumulative_counters_only_ever_increase() {
+    // total-requests is a running total; a decrease would mean we are reading the wrong field
+    // or the wrong bytes.
+    let parsed = parse(ASPNET_NET10_LOADED);
+    let totals: Vec<f64> = parsed
+        .samples
+        .iter()
+        .filter(|s| s.name == "total-requests")
+        .map(|s| s.value)
+        .collect();
+
+    assert!(totals.len() >= 2, "need several intervals to compare");
+    assert!(
+        totals.windows(2).all(|w| w[1] >= w[0]),
+        "total-requests went backwards: {totals:?}"
+    );
+    assert!(totals.last() > totals.first(), "traffic should have accumulated");
+}
+
+#[test]
+fn a_console_app_gets_the_generic_dashboard() {
+    let by_provider = names_by_provider(&parse(CONSOLE_NET8));
+    assert!(by_provider.contains_key("System.Runtime"));
+    assert!(!by_provider.contains_key("Microsoft.AspNetCore.Hosting"));
+    assert!(!by_provider.contains_key("Microsoft-AspNetCore-Server-Kestrel"));
+}
+
+#[test]
+fn net8_reports_the_counters_that_were_added_in_net8() {
+    // gen-0-gc-budget and total-pause-time-by-gc arrived in .NET 8; their presence confirms the
+    // fixture really is .NET 8 and that version-specific counters decode.
+    let by_provider = names_by_provider(&parse(CONSOLE_NET8));
+    let runtime = &by_provider["System.Runtime"];
+    assert!(runtime.contains("gen-0-gc-budget"));
+    assert!(runtime.contains("total-pause-time-by-gc"));
 }
 
 #[test]
