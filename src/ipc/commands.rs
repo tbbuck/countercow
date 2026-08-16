@@ -88,6 +88,19 @@ impl ProcessInfo {
         let (major, minor) = self.clr_major_minor()?;
         Some(format!("net{major}.{minor}"))
     }
+
+    /// The name worth showing, given the OS-level process name.
+    ///
+    /// Framework-dependent apps are launched through the host, so the OS only knows them as
+    /// "dotnet"; the runtime knows its own entry assembly, which is what a person recognises.
+    /// A self-contained app has a real executable name already, and that wins.
+    pub fn display_name<'a>(&'a self, process_name: &'a str) -> &'a str {
+        let assembly = self.assembly_name.as_deref().filter(|a| !a.is_empty());
+        match assembly {
+            Some(assembly) if process_name == "dotnet" => assembly,
+            _ => process_name,
+        }
+    }
 }
 
 /// Query process identity, trying ProcessInfo3 then 2 then 1.
@@ -262,6 +275,27 @@ mod tests {
     #[test]
     fn missing_clr_version_yields_no_label() {
         assert_eq!(ProcessInfo::default().framework_label(), None);
+    }
+
+    #[test]
+    fn display_name_prefers_the_assembly_only_for_host_launched_apps() {
+        let info = ProcessInfo {
+            assembly_name: Some("CrimeRate.Front".into()),
+            ..Default::default()
+        };
+        // Framework-dependent: the OS only knows it as "dotnet".
+        assert_eq!(info.display_name("dotnet"), "CrimeRate.Front");
+        // Self-contained: the executable name is already meaningful and more specific.
+        assert_eq!(info.display_name("Rider.Backend"), "Rider.Backend");
+    }
+
+    #[test]
+    fn display_name_falls_back_when_no_assembly_is_reported() {
+        // ProcessInfo v1 carries no assembly name at all.
+        assert_eq!(ProcessInfo::default().display_name("dotnet"), "dotnet");
+
+        let empty = ProcessInfo { assembly_name: Some(String::new()), ..Default::default() };
+        assert_eq!(empty.display_name("dotnet"), "dotnet");
     }
 
     #[test]

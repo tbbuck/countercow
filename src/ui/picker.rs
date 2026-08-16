@@ -18,20 +18,11 @@ pub struct Entry {
 }
 
 impl Entry {
-    /// The name worth showing.
-    ///
-    /// Discovery often yields "dotnet" for framework-dependent apps launched via the host, but
-    /// the runtime knows its own entry assembly, which is what a person is actually looking for.
+    /// The name worth showing, preferring the runtime-reported entry assembly.
     pub fn display_name(&self) -> &str {
-        let assembly = self
-            .info
-            .as_ref()
-            .and_then(|i| i.assembly_name.as_deref())
-            .filter(|name| !name.is_empty());
-
-        match assembly {
-            Some(assembly) if self.process.name == "dotnet" => assembly,
-            _ => &self.process.name,
+        match &self.info {
+            Some(info) => info.display_name(&self.process.name),
+            None => &self.process.name,
         }
     }
 

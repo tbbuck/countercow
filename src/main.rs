@@ -73,7 +73,7 @@ fn dump_counters(process: &DotnetProcess, seconds: u64, interval: f64) -> Result
     let info = ipc::commands::process_info(&process.socket)?;
     println!(
         "{} (pid {}, {})  —  {interval}s interval, {seconds}s window",
-        process.name,
+        info.display_name(&process.name),
         process.pid,
         info.framework_label().unwrap_or_else(|| "unknown runtime".into())
     );
@@ -137,17 +137,49 @@ fn resolve_target(pid: Option<u32>, name: Option<&str>) -> Result<Option<DotnetP
     let needle = name.unwrap().to_lowercase();
     let mut matches: Vec<DotnetProcess> = found
         .processes
-        .into_iter()
+        .iter()
         .filter(|p| p.name.to_lowercase().contains(&needle))
+        .cloned()
         .collect();
 
+    // Framework-dependent apps are launched through the host, so their process name is just
+    // "dotnet" and matching on it is useless. Ask the runtimes for their entry assembly instead.
+    // Only worth the round trips once the cheap match has come up empty.
+    if matches.is_empty() {
+        matches = found
+            .processes
+            .iter()
+            .filter(|p| {
+                ipc::commands::process_info(&p.socket)
+                    .ok()
+                    .and_then(|info| info.assembly_name)
+                    .is_some_and(|assembly| assembly.to_lowercase().contains(&needle))
+            })
+            .cloned()
+            .collect();
+    }
+
     match matches.len() {
-        0 => bail!("no attachable .NET process whose name contains {needle:?}"),
+        0 => bail!(
+            "no attachable .NET process whose name or entry assembly contains {needle:?}. \
+             Run `countercow ps` to see what is available."
+        ),
         1 => Ok(Some(matches.remove(0))),
         _ => {
+            // Identical process names are the common case here, so lead with something that
+            // actually distinguishes them.
             let names: Vec<String> = matches
                 .iter()
-                .map(|p| format!("{} (pid {})", p.name, p.pid))
+                .map(|p| {
+                    let assembly = ipc::commands::process_info(&p.socket)
+                        .ok()
+                        .and_then(|info| info.assembly_name)
+                        .filter(|a| !a.is_empty() && *a != p.name);
+                    match assembly {
+                        Some(assembly) => format!("{assembly} (pid {})", p.pid),
+                        None => format!("{} (pid {})", p.name, p.pid),
+                    }
+                })
                 .collect();
             bail!(
                 "{:?} matches {} processes: {}. Use --pid to pick one.",
@@ -165,7 +197,7 @@ fn list_processes() -> Result<()> {
     if found.processes.is_empty() {
         println!("No attachable .NET processes found in {}.", discovery::ipc_root().display());
     } else {
-        println!("{:>7}  {:<24}  {}", "PID", "NAME", "COMMAND");
+        println!("{:>7}  {:<24}  COMMAND", "PID", "NAME");
         for process in &found.processes {
             println!(
                 "{:>7}  {:<24}  {}",

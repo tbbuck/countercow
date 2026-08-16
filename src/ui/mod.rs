@@ -88,11 +88,8 @@ fn run_picker(terminal: &mut DefaultTerminal, picker: &mut Picker, theme: &Theme
                 picker.cancelled = true;
                 return Ok(());
             }
-            KeyCode::Enter => {
-                if picker.selected().is_some() {
-                    return Ok(());
-                }
-            }
+            // Enter on an empty list does nothing; there is nothing to attach to.
+            KeyCode::Enter if picker.selected().is_some() => return Ok(()),
             KeyCode::Up | KeyCode::Char('k') => picker.move_by(-1),
             KeyCode::Down | KeyCode::Char('j') => picker.move_by(1),
             KeyCode::PageUp => picker.move_by(-10),

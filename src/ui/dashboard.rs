@@ -58,12 +58,13 @@ fn render_header(frame: &mut Frame, area: Rect, app: &App, theme: &Theme) {
 
     // Build up detail only while it fits, so a narrow terminal drops the least important parts
     // rather than truncating mid-word.
+    let name = app.info.display_name(&app.process.name);
     let mut spans = vec![
-        Span::from(app.process.name.clone()).fg(theme.accent).bold(),
+        Span::from(name.to_owned()).fg(theme.accent).bold(),
         Span::from("  pid ").fg(theme.dim),
         Span::from(app.process.pid.to_string()),
     ];
-    let mut used: usize = app.process.name.chars().count() + 6 + app.process.pid.to_string().len();
+    let mut used: usize = name.chars().count() + 6 + app.process.pid.to_string().len();
 
     let push_if_fits = |text: String, dim: bool, used: &mut usize, spans: &mut Vec<Span>| {
         let needed = text.chars().count() + 2;

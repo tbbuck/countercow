@@ -282,7 +282,7 @@ mod tests {
             self.buf.extend_from_slice(&(content.len() as i32).to_le_bytes());
             // Alignment padding is relative to the absolute stream offset.
             let padding = (4 - (self.buf.len() & 3)) & 3;
-            self.buf.extend(std::iter::repeat(0u8).take(padding));
+            self.buf.extend(std::iter::repeat_n(0u8, padding));
             self.buf.extend_from_slice(&content);
             self.buf.push(tag::END_OBJECT);
             self

@@ -72,8 +72,7 @@ fn latest(parsed: &Parsed, name: &str) -> CounterSample {
     parsed
         .samples
         .iter()
-        .filter(|s| s.name == name)
-        .next_back()
+        .rfind(|s| s.name == name)
         .unwrap_or_else(|| panic!("no sample named {name}"))
         .clone()
 }

@@ -200,7 +200,7 @@ mod tests {
     #[test]
     fn size_covers_header_plus_payload() {
         // The worked CollectTracing2 example is 115 payload bytes => size 135 = 0x0087.
-        let msg = encode_message(0x02, 0x03, &vec![0u8; 115]).unwrap();
+        let msg = encode_message(0x02, 0x03, &[0u8; 115]).unwrap();
         assert_eq!(&msg[14..16], &[0x87, 0x00]);
     }
 
