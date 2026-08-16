@@ -1,0 +1,22 @@
+[package]
+name = "countercow"
+version = "0.1.0"
+edition = "2021"
+description = "A btop for .NET: live runtime counters, GC and allocation forensics, and a CPU profiler, in one terminal binary"
+license = "MIT"
+repository = "https://github.com/tbbuck/countercow"
+readme = "README.md"
+keywords = ["dotnet", "tui", "profiler", "diagnostics", "eventpipe"]
+categories = ["command-line-utilities", "development-tools::profiling"]
+
+[dependencies]
+clap = { version = "4", features = ["derive"] }
+color-eyre = "0.6"
+crossbeam-channel = "0.5"
+crossterm = "0.29"
+ratatui = "0.30.2"
+sysinfo = "=0.39.6"
+
+[profile.release]
+lto = true
+strip = true

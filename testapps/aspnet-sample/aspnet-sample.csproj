@@ -1,0 +1,15 @@
+<Project Sdk="Microsoft.NET.Sdk.Web">
+
+  <PropertyGroup>
+    <!-- Multi-targeted so the parser can be checked against the metadata each runtime emits.
+         Counter sets differ: gen-0-gc-budget and total-pause-time-by-gc arrive in .NET 8. -->
+    <TargetFrameworks>net8.0;net10.0</TargetFrameworks>
+    <Nullable>enable</Nullable>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <AssemblyName>CounterCowSampleApi</AssemblyName>
+    <RootNamespace>CounterCowSampleApi</RootNamespace>
+    <!-- Keeps the working tree tidy; countercow does not read these. -->
+    <GenerateDocumentationFile>false</GenerateDocumentationFile>
+  </PropertyGroup>
+
+</Project>

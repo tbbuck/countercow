@@ -1,1 +1,4 @@
 .claude
+/target
+testapps/**/bin
+testapps/**/obj
