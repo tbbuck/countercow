@@ -1,0 +1,16 @@
+[package]
+name = "countercow"
+version = "0.1.0"
+edition = "2021"
+description = "A btop-style TUI for .NET runtime counters"
+license = "MIT"
+
+[dependencies]
+clap = { version = "4", features = ["derive"] }
+color-eyre = "0.6"
+crossbeam-channel = "0.5"
+sysinfo = "=0.39.6"
+
+[profile.release]
+lto = true
+strip = true
