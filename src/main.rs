@@ -1,4 +1,9 @@
+mod counters;
 mod ipc;
+mod nettrace;
+
+use std::ops::ControlFlow;
+use std::time::Instant;
 
 use clap::{Parser, Subcommand};
 use color_eyre::eyre::{bail, Result};
@@ -24,6 +29,15 @@ struct Cli {
 enum Command {
     /// List attachable .NET processes and exit.
     Ps,
+    /// Print raw counter samples as they arrive. Diagnostic aid for the parser.
+    Dump {
+        /// Stop after this many seconds.
+        #[arg(long, default_value_t = 5)]
+        seconds: u64,
+        /// Counter refresh interval in seconds.
+        #[arg(long, default_value_t = counters::session::DEFAULT_INTERVAL_SECS)]
+        interval: f64,
+    },
 }
 
 fn main() -> Result<()> {
@@ -32,6 +46,12 @@ fn main() -> Result<()> {
 
     match cli.command {
         Some(Command::Ps) => list_processes(),
+        Some(Command::Dump { seconds, interval }) => {
+            let Some(process) = resolve_target(cli.pid, cli.name.as_deref())? else {
+                bail!("dump needs a target: pass --pid or --name");
+            };
+            dump_counters(&process, seconds, interval)
+        }
         None => {
             // The TUI lands in a later phase; for now resolve the target so the selection
             // logic is exercised end to end.
@@ -58,6 +78,50 @@ fn main() -> Result<()> {
             }
         }
     }
+}
+
+/// Stream counters to stdout for a fixed window, grouped by provider.
+fn dump_counters(process: &DotnetProcess, seconds: u64, interval: f64) -> Result<()> {
+    let info = ipc::commands::process_info(&process.socket)?;
+    println!(
+        "{} (pid {}, {})  —  {interval}s interval, {seconds}s window",
+        process.name,
+        process.pid,
+        info.framework_label().unwrap_or_else(|| "unknown runtime".into())
+    );
+
+    let deadline = Instant::now() + std::time::Duration::from_secs(seconds);
+    let mut count = 0usize;
+    let mut providers: std::collections::BTreeSet<String> = Default::default();
+
+    counters::session::stream(&process.socket, interval, |sample| {
+        if Instant::now() >= deadline {
+            return ControlFlow::Break(());
+        }
+        count += 1;
+        providers.insert(sample.provider.clone());
+
+        let units = sample.units();
+        let suffix = match sample.rate_seconds() {
+            Some(secs) if secs > 1.0 => format!(" {units} / {:.0} min", secs / 60.0),
+            Some(_) => format!(" {units} / sec"),
+            None if units.is_empty() => String::new(),
+            None => format!(" {units}"),
+        };
+        println!(
+            "  {:<38} {:>16.4}{}",
+            format!("{}/{}", sample.provider, sample.name),
+            sample.value,
+            suffix
+        );
+        ControlFlow::Continue(())
+    })?;
+
+    println!("\n{count} samples from {} providers:", providers.len());
+    for provider in &providers {
+        println!("  {provider}");
+    }
+    Ok(())
 }
 
 /// Resolve `--pid` / `--name` to exactly one process, or `None` if neither was given.
