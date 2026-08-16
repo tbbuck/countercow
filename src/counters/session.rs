@@ -4,7 +4,7 @@ use std::fmt;
 use std::ops::ControlFlow;
 use std::path::Path;
 
-use crate::ipc::commands::{self, CommandError, Provider, TraceConfig};
+use crate::ipc::commands::{self, CommandError, Provider, TraceConfig, TraceSession};
 use crate::nettrace::blocks::NettraceParser;
 use crate::nettrace::reader::ParseError;
 
@@ -89,37 +89,35 @@ impl From<ParseError> for SessionError {
     }
 }
 
-/// Stream counter samples until `on_sample` asks to stop or the process exits.
+/// Open a counter session. The returned stream carries nettrace from this point on.
+pub fn start(socket: &Path, interval_secs: f64) -> Result<TraceSession, SessionError> {
+    Ok(commands::start_tracing(socket, &trace_config(interval_secs))?)
+}
+
+/// Ask the runtime to end a session.
 ///
-/// On stop, the session is closed over a second connection and the original stream is then
-/// drained to EOF — the runtime keeps writing into it after acknowledging the stop, and
-/// abandoning it early truncates the trace.
-pub fn stream<F>(
-    socket: &Path,
+/// This goes out on a fresh connection — the protocol permits one command per connection — and
+/// causes the streaming socket to reach EOF, which is how [`run`] learns to finish.
+pub fn stop(socket: &Path, session_id: u64) -> Result<(), SessionError> {
+    Ok(commands::stop_tracing(socket, session_id)?)
+}
+
+/// Parse a session's stream, reporting counter samples until the callback breaks, the process
+/// exits, or the session is stopped from elsewhere.
+pub fn run<F>(
+    stream: impl std::io::Read,
     interval_secs: f64,
     mut on_sample: F,
 ) -> Result<(), SessionError>
 where
     F: FnMut(CounterSample) -> ControlFlow<()>,
 {
-    let session = commands::start_tracing(socket, &trace_config(interval_secs))?;
-    let session_id = session.session_id;
-    let mut parser = NettraceParser::new(session.stream)?;
-    let mut stopping = false;
+    let mut parser = NettraceParser::new(stream)?;
 
     loop {
-        let batch = match parser.next_events() {
-            Ok(Some(batch)) => batch,
-            Ok(None) => return Ok(()),
-            // Once we have asked to stop, a ragged tail is expected rather than a failure.
-            Err(_) if stopping => return Ok(()),
-            Err(e) => return Err(e.into()),
+        let Some(batch) = parser.next_events()? else {
+            return Ok(());
         };
-
-        if stopping {
-            // Draining after stop: keep reading, but no longer report.
-            continue;
-        }
 
         for event in batch {
             let Some(metadata) = parser.metadata().get(event.metadata_id) else {
@@ -141,9 +139,7 @@ where
             }
 
             if on_sample(sample).is_break() {
-                commands::stop_tracing(socket, session_id)?;
-                stopping = true;
-                break;
+                return Ok(());
             }
         }
     }

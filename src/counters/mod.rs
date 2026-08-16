@@ -2,5 +2,6 @@
 
 #![allow(dead_code)]
 
+pub mod catalog;
 pub mod sample;
 pub mod session;

@@ -7,6 +7,7 @@ use color_eyre::eyre::{bail, Result};
 use countercow::counters;
 use countercow::ipc;
 use countercow::ipc::discovery::{self, DotnetProcess};
+use countercow::ui;
 
 #[derive(Parser)]
 #[command(name = "countercow", version, about = "A btop-style TUI for .NET runtime counters")]
@@ -18,6 +19,10 @@ struct Cli {
     /// Attach to the single process whose name contains this text.
     #[arg(long, global = true)]
     name: Option<String>,
+
+    /// Counter refresh interval in seconds.
+    #[arg(long, global = true, default_value_t = counters::session::DEFAULT_INTERVAL_SECS)]
+    interval: f64,
 
     #[command(subcommand)]
     command: Option<Command>,
@@ -32,9 +37,6 @@ enum Command {
         /// Stop after this many seconds.
         #[arg(long, default_value_t = 5)]
         seconds: u64,
-        /// Counter refresh interval in seconds.
-        #[arg(long, default_value_t = counters::session::DEFAULT_INTERVAL_SECS)]
-        interval: f64,
     },
 }
 
@@ -44,36 +46,24 @@ fn main() -> Result<()> {
 
     match cli.command {
         Some(Command::Ps) => list_processes(),
-        Some(Command::Dump { seconds, interval }) => {
+        Some(Command::Dump { seconds }) => {
             let Some(process) = resolve_target(cli.pid, cli.name.as_deref())? else {
                 bail!("dump needs a target: pass --pid or --name");
             };
-            dump_counters(&process, seconds, interval)
+            dump_counters(&process, seconds, cli.interval)
         }
         None => {
-            // The TUI lands in a later phase; for now resolve the target so the selection
-            // logic is exercised end to end.
-            let target = resolve_target(cli.pid, cli.name.as_deref())?;
-            match target {
-                Some(process) => {
-                    let info = ipc::commands::process_info(&process.socket)?;
-                    println!("{} (pid {})", process.name, process.pid);
-                    println!("  runtime  {}", info.framework_label().unwrap_or_else(|| "unknown".into()));
-                    println!("  arch     {} {}", info.os, info.arch);
-                    if let Some(assembly) = &info.assembly_name {
-                        if !assembly.is_empty() {
-                            println!("  assembly {assembly}");
-                        }
-                    }
-                    println!("\nDashboard not implemented yet.");
-                    Ok(())
-                }
-                None => {
-                    list_processes()?;
-                    println!("\nPass --pid or --name to attach.");
-                    Ok(())
-                }
-            }
+            // --pid/--name skip the picker; otherwise choose interactively.
+            let target = match resolve_target(cli.pid, cli.name.as_deref())? {
+                Some(process) => Some(process),
+                None => ui::pick_process()?,
+            };
+            let Some(process) = target else {
+                return Ok(());
+            };
+
+            let info = ipc::commands::process_info(&process.socket)?;
+            ui::run_dashboard(process, info, cli.interval)
         }
     }
 }
@@ -92,7 +82,10 @@ fn dump_counters(process: &DotnetProcess, seconds: u64, interval: f64) -> Result
     let mut count = 0usize;
     let mut providers: std::collections::BTreeSet<String> = Default::default();
 
-    counters::session::stream(&process.socket, interval, |sample| {
+    let session = counters::session::start(&process.socket, interval)?;
+    let session_id = session.session_id;
+
+    counters::session::run(session.stream, interval, |sample| {
         if Instant::now() >= deadline {
             return ControlFlow::Break(());
         }
@@ -114,6 +107,7 @@ fn dump_counters(process: &DotnetProcess, seconds: u64, interval: f64) -> Result
         );
         ControlFlow::Continue(())
     })?;
+    counters::session::stop(&process.socket, session_id)?;
 
     println!("\n{count} samples from {} providers:", providers.len());
     for provider in &providers {

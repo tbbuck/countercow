@@ -7,6 +7,8 @@
 //! * [`nettrace`] parses the EventPipe stream that a tracing session returns.
 //! * [`counters`] turns `EventCounters` events into samples worth displaying.
 
+pub mod app;
 pub mod counters;
 pub mod ipc;
 pub mod nettrace;
+pub mod ui;

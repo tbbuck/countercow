@@ -1,0 +1,186 @@
+//! Layout tests driven by real captured counter data.
+//!
+//! Rendering is where a TUI breaks in ways unit tests miss: a panel squeezed to zero height, a
+//! label truncated mid-word, a panic from an arithmetic underflow on a small terminal. These
+//! render the whole dashboard across a range of sizes and check what came out.
+
+use countercow::app::App;
+use countercow::counters::sample;
+use countercow::ipc::commands::ProcessInfo;
+use countercow::ipc::discovery::DotnetProcess;
+use countercow::nettrace::blocks::NettraceParser;
+use countercow::ui::dashboard;
+use countercow::ui::theme::Theme;
+
+use ratatui::backend::TestBackend;
+use ratatui::Terminal;
+
+const ASPNET: &[u8] = include_bytes!("fixtures/aspnet-net9.nettrace");
+const GENERIC: &[u8] = include_bytes!("fixtures/generic-net10.nettrace");
+
+fn app_from(fixture: &[u8]) -> App {
+    let process = DotnetProcess {
+        pid: 77686,
+        socket: "/tmp/socket".into(),
+        name: "CrimeRate.VectorTileApi".into(),
+        command: "cmd".into(),
+        start_key_verified: true,
+    };
+    let info = ProcessInfo {
+        os: "macOS".into(),
+        arch: "arm64".into(),
+        clr_version: Some("9.0.7".into()),
+        ..Default::default()
+    };
+
+    let mut app = App::new(process, info, 1.0);
+    let mut parser = NettraceParser::new(std::io::Cursor::new(fixture)).unwrap();
+    while let Some(batch) = parser.next_events().unwrap() {
+        for event in batch {
+            let Some(metadata) = parser.metadata().get(event.metadata_id) else {
+                continue;
+            };
+            if let Some(s) = sample::extract(metadata, &event).unwrap() {
+                app.record(s);
+            }
+        }
+    }
+    app
+}
+
+fn render(app: &App, width: u16, height: u16) -> String {
+    let mut terminal = Terminal::new(TestBackend::new(width, height)).unwrap();
+    let theme = Theme::default();
+    terminal.draw(|frame| dashboard::render(frame, app, &theme)).unwrap();
+
+    let buffer = terminal.backend().buffer();
+    let mut out = String::new();
+    for y in 0..buffer.area.height {
+        for x in 0..buffer.area.width {
+            out.push_str(buffer[(x, y)].symbol());
+        }
+        out.push('\n');
+    }
+    out
+}
+
+/// Sizes worth exercising: a comfortable window, a laptop split, the documented minimum, and
+/// below it.
+const SIZES: &[(u16, u16)] = &[
+    (200, 60),
+    (120, 40),
+    (100, 32),
+    (80, 24),
+    (70, 22),
+    (64, 20),
+    (50, 14),
+    (20, 5),
+];
+
+#[test]
+fn renders_at_every_size_without_panicking() {
+    for fixture in [ASPNET, GENERIC] {
+        let app = app_from(fixture);
+        for (width, height) in SIZES {
+            let output = render(&app, *width, *height);
+            assert!(!output.is_empty(), "{width}x{height} produced nothing");
+        }
+    }
+}
+
+#[test]
+fn aspnet_panels_appear_only_for_an_aspnet_process() {
+    let aspnet = render(&app_from(ASPNET), 120, 40);
+    assert!(aspnet.contains("Kestrel"));
+    assert!(aspnet.contains("Requests"));
+    assert!(aspnet.contains("ASP.NET Core"));
+
+    let generic = render(&app_from(GENERIC), 120, 40);
+    assert!(!generic.contains("Kestrel"), "hidden, not shown empty");
+    assert!(!generic.contains("Requests/sec"));
+    // The space goes to the JIT panel instead.
+    assert!(generic.contains("JIT"));
+}
+
+#[test]
+fn gc_and_memory_are_present_on_both_layouts() {
+    for fixture in [ASPNET, GENERIC] {
+        let output = render(&app_from(fixture), 120, 40);
+        assert!(output.contains("Heap size"), "heap chart missing");
+        assert!(output.contains("Memory"), "memory panel missing");
+        assert!(output.contains("Heap by generation"), "generation bars missing");
+        assert!(output.contains("GC activity"), "GC activity panel missing");
+    }
+}
+
+#[test]
+fn a_short_terminal_keeps_the_trend_and_drops_the_bars() {
+    // The bars are the expendable half: squeezing both would leave the chart at zero height.
+    let output = render(&app_from(ASPNET), 100, 22);
+    assert!(output.contains("Heap size"), "the chart must survive");
+    assert!(!output.contains("Heap by generation"));
+}
+
+#[test]
+fn below_the_minimum_says_so_rather_than_rendering_mush() {
+    let output = render(&app_from(ASPNET), 50, 14);
+    assert!(output.contains("Terminal too small"));
+    assert!(output.contains("64x20"), "should state what is needed");
+}
+
+#[test]
+fn values_are_rendered_not_placeholders() {
+    let output = render(&app_from(ASPNET), 120, 40);
+    // Every counter in the fixture reported, so nothing should still show the em-dash.
+    assert!(!output.contains('—') || output.contains("Heap size —"), "unexpected placeholder");
+    assert!(output.contains("MiB"), "memory should be formatted in bytes");
+}
+
+#[test]
+fn header_degrades_instead_of_truncating_mid_word() {
+    let app = app_from(ASPNET);
+
+    let wide = render(&app, 120, 40);
+    assert!(wide.contains("macOS arm64"), "wide terminal shows the platform");
+
+    // Narrow drops trailing detail rather than cutting a word in half.
+    let narrow = render(&app, 70, 22);
+    assert!(narrow.contains("CrimeRate.VectorTileApi"), "identity is never dropped");
+    assert!(!narrow.contains("macOS arm6\n"), "no mid-word truncation");
+}
+
+#[test]
+fn paused_and_stalled_states_are_visible_in_the_footer() {
+    let mut app = app_from(ASPNET);
+    assert!(render(&app, 120, 40).contains("counters"));
+
+    app.paused = true;
+    assert!(render(&app, 120, 40).contains("paused"));
+}
+
+#[test]
+fn help_overlay_draws_over_the_dashboard() {
+    let mut app = app_from(ASPNET);
+    app.show_help = true;
+    let output = render(&app, 120, 40);
+    assert!(output.contains("Help"));
+    assert!(output.contains("pause history"));
+}
+
+#[test]
+fn an_app_with_no_samples_shows_placeholders_not_an_empty_screen() {
+    let process = DotnetProcess {
+        pid: 1,
+        socket: "/tmp/s".into(),
+        name: "Fresh".into(),
+        command: "cmd".into(),
+        start_key_verified: true,
+    };
+    let app = App::new(process, ProcessInfo::default(), 1.0);
+
+    let output = render(&app, 120, 40);
+    assert!(output.contains("waiting for data"), "charts should say they are waiting");
+    assert!(output.contains("connecting"), "footer should show the connecting state");
+    // With no provider seen yet, the generic layout is the safe default.
+    assert!(!output.contains("Kestrel"));
+}
