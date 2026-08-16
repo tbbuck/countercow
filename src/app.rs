@@ -23,6 +23,15 @@ pub enum AppEvent {
     SessionEnded(Option<String>),
 }
 
+/// How a dashboard session ended.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Exit {
+    /// Leave countercow entirely.
+    Quit,
+    /// Go back to the process picker to attach to something else.
+    Detach,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Status {
     /// Attached, but no counters have arrived yet.
@@ -60,7 +69,8 @@ pub struct App {
     pub status: Status,
     pub paused: bool,
     pub show_help: bool,
-    pub should_quit: bool,
+    /// Set once the user asks to leave this dashboard, and how.
+    pub exit: Option<Exit>,
     started: Instant,
     pub last_sample_at: Option<Instant>,
     /// Counts every sample received, so the footer can show the session is alive.
@@ -78,7 +88,7 @@ impl App {
             status: Status::Connecting,
             paused: false,
             show_help: false,
-            should_quit: false,
+            exit: None,
             started: Instant::now(),
             last_sample_at: None,
             samples_seen: 0,

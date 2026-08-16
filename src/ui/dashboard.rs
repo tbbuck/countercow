@@ -111,6 +111,8 @@ fn render_footer(frame: &mut Frame, area: Rect, app: &App, theme: &Theme) {
     let line = Line::from(vec![
         Span::from(" q").fg(theme.accent),
         Span::from(" quit  ").fg(theme.dim),
+        Span::from("d").fg(theme.accent),
+        Span::from(" detach  ").fg(theme.dim),
         Span::from("p").fg(theme.accent),
         Span::from(" pause  ").fg(theme.dim),
         Span::from("m").fg(theme.accent),
@@ -299,6 +301,7 @@ fn render_help(frame: &mut Frame, area: Rect, theme: &Theme) {
         Line::from(Span::from("countercow").fg(theme.accent).bold()),
         Line::from(""),
         Line::from("  q / Esc   quit"),
+        Line::from("  d         detach and pick another process"),
         Line::from("  p         pause history (session keeps running)"),
         Line::from("  m         switch braille / octant plotting"),
         Line::from("  ?         toggle this help"),

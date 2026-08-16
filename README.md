@@ -34,9 +34,13 @@ countercow ps              # list attachable processes and exit
 | Key | |
 |---|---|
 | `q` / `Esc` | quit |
+| `d` | detach and pick another process |
 | `p` | pause history (the session keeps running) |
 | `m` | switch braille / octant plotting |
 | `?` | help |
+
+Detaching closes the EventPipe session properly and re-discovers processes, so it picks up
+anything that has started since — handy when the thing you want to watch is still building.
 
 ## What it shows
 

@@ -53,17 +53,10 @@ fn main() -> Result<()> {
             dump_counters(&process, seconds, cli.interval)
         }
         None => {
-            // --pid/--name skip the picker; otherwise choose interactively.
-            let target = match resolve_target(cli.pid, cli.name.as_deref())? {
-                Some(process) => Some(process),
-                None => ui::pick_process()?,
-            };
-            let Some(process) = target else {
-                return Ok(());
-            };
-
-            let info = ipc::commands::process_info(&process.socket)?;
-            ui::run_dashboard(process, info, cli.interval)
+            // --pid/--name supply the first target; without them, and after any detach, the
+            // picker chooses.
+            let target = resolve_target(cli.pid, cli.name.as_deref())?;
+            ui::run(target, cli.interval)
         }
     }
 }

@@ -19,7 +19,7 @@ use crossbeam_channel::{bounded, Receiver, Sender};
 use crossterm::event::{Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
 use ratatui::DefaultTerminal;
 
-use crate::app::{App, AppEvent, Status};
+use crate::app::{App, AppEvent, Exit, Status};
 use crate::counters::session;
 use crate::ipc::commands::{self, ProcessInfo};
 use crate::ipc::discovery::{self, DotnetProcess};
@@ -54,9 +54,45 @@ fn ensure_terminal() -> Result<()> {
     )
 }
 
-/// Show the picker and return the chosen process, or `None` if the user quit.
-pub fn pick_process() -> Result<Option<DotnetProcess>> {
+/// Run countercow's interactive session: picker, dashboard, and back again on detach.
+///
+/// One terminal spans the whole session. Tearing it down between screens would flicker the
+/// alternate screen on every detach.
+pub fn run(mut target: Option<DotnetProcess>, interval: f64) -> Result<()> {
     ensure_terminal()?;
+    let mut terminal = ratatui::init();
+    let result = session_loop(&mut terminal, &mut target, interval);
+    ratatui::restore();
+    result
+}
+
+fn session_loop(
+    terminal: &mut DefaultTerminal,
+    target: &mut Option<DotnetProcess>,
+    interval: f64,
+) -> Result<()> {
+    loop {
+        // `--pid`/`--name` supply the first target; after a detach we always return to the picker.
+        let process = match target.take() {
+            Some(process) => process,
+            None => match pick_process(terminal)? {
+                Some(process) => process,
+                None => return Ok(()),
+            },
+        };
+
+        let info = commands::process_info(&process.socket)?;
+        match run_dashboard(terminal, process, info, interval)? {
+            Exit::Quit => return Ok(()),
+            Exit::Detach => continue,
+        }
+    }
+}
+
+/// Show the picker and return the chosen process, or `None` if the user quit.
+fn pick_process(terminal: &mut DefaultTerminal) -> Result<Option<DotnetProcess>> {
+    // Re-discover every time: processes come and go while countercow is running, and a detach is
+    // usually motivated by wanting something that has just started.
     let found = discovery::discover()?;
 
     // Ask each runtime who it is. Discovery reports "dotnet" for framework-dependent apps, which
@@ -72,11 +108,7 @@ pub fn pick_process() -> Result<Option<DotnetProcess>> {
         .collect();
 
     let mut picker = Picker::new(found, entries);
-    let theme = Theme::default();
-    let mut terminal = ratatui::init();
-    let result = run_picker(&mut terminal, &mut picker, &theme);
-    ratatui::restore();
-    result?;
+    run_picker(terminal, &mut picker, &Theme::default())?;
 
     Ok(if picker.cancelled {
         None
@@ -119,10 +151,13 @@ fn run_picker(terminal: &mut DefaultTerminal, picker: &mut Picker, theme: &Theme
     }
 }
 
-/// Attach to a process and run the dashboard until the user quits or the process exits.
-pub fn run_dashboard(process: DotnetProcess, info: ProcessInfo, interval: f64) -> Result<()> {
-    ensure_terminal()?;
-
+/// Attach to a process and run the dashboard until the user leaves or the process exits.
+fn run_dashboard(
+    terminal: &mut DefaultTerminal,
+    process: DotnetProcess,
+    info: ProcessInfo,
+    interval: f64,
+) -> Result<Exit> {
     let socket = process.socket.clone();
     let session = session::start(&socket, interval)?;
     let session_id = session.session_id;
@@ -135,13 +170,11 @@ pub fn run_dashboard(process: DotnetProcess, info: ProcessInfo, interval: f64) -
 
     let mut app = App::new(process, info, interval);
     let mut theme = Theme::default();
-
-    let mut terminal = ratatui::init();
-    let result = event_loop(&mut terminal, &mut app, &mut theme, &rx);
-    ratatui::restore();
+    let result = event_loop(terminal, &mut app, &mut theme, &rx);
 
     // Close the session properly rather than letting the socket drop, so the runtime tears down
-    // its EventPipe session promptly.
+    // its EventPipe session promptly. This matters more now that detaching is possible: leaking
+    // a session per attach would accumulate in the target process.
     stop.store(true, Ordering::Relaxed);
     if let Err(e) = session::stop(&socket, session_id) {
         // The usual cause is that the process already exited, which is not worth failing over.
@@ -150,7 +183,7 @@ pub fn run_dashboard(process: DotnetProcess, info: ProcessInfo, interval: f64) -
         }
     }
 
-    result
+    result.map(|()| app.exit.unwrap_or(Exit::Quit))
 }
 
 fn spawn_input_reader(tx: Sender<AppEvent>, stop: Arc<AtomicBool>) {
@@ -221,7 +254,7 @@ fn event_loop(
             handle_event(app, theme, event);
         }
 
-        if app.should_quit {
+        if app.exit.is_some() {
             return Ok(());
         }
     }
@@ -254,10 +287,11 @@ fn handle_key(app: &mut App, theme: &mut Theme, key: KeyEvent) {
     }
 
     match key.code {
-        KeyCode::Char('q') | KeyCode::Esc => app.should_quit = true,
+        KeyCode::Char('q') | KeyCode::Esc => app.exit = Some(Exit::Quit),
         KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => {
-            app.should_quit = true;
+            app.exit = Some(Exit::Quit);
         }
+        KeyCode::Char('d') => app.exit = Some(Exit::Detach),
         KeyCode::Char('p') | KeyCode::Char(' ') => app.paused = !app.paused,
         KeyCode::Char('m') => theme.toggle_marker(),
         KeyCode::Char('?') | KeyCode::Char('h') => app.show_help = true,
@@ -291,8 +325,15 @@ mod tests {
         for code in [KeyCode::Char('q'), KeyCode::Esc] {
             let mut app = app();
             handle_key(&mut app, &mut Theme::default(), press(code));
-            assert!(app.should_quit, "{code:?} should quit");
+            assert_eq!(app.exit, Some(Exit::Quit), "{code:?} should quit");
         }
+    }
+
+    #[test]
+    fn d_detaches_rather_than_quitting() {
+        let mut app = app();
+        handle_key(&mut app, &mut Theme::default(), press(KeyCode::Char('d')));
+        assert_eq!(app.exit, Some(Exit::Detach));
     }
 
     #[test]
@@ -303,14 +344,14 @@ mod tests {
             &mut Theme::default(),
             KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL),
         );
-        assert!(app.should_quit);
+        assert_eq!(app.exit, Some(Exit::Quit));
     }
 
     #[test]
     fn plain_c_does_not_quit() {
         let mut app = app();
         handle_key(&mut app, &mut Theme::default(), press(KeyCode::Char('c')));
-        assert!(!app.should_quit);
+        assert_eq!(app.exit, None);
     }
 
     #[test]
@@ -336,7 +377,7 @@ mod tests {
         handle_key(&mut app, &mut Theme::default(), press(KeyCode::Char('x')));
         assert!(!app.show_help);
         // Dismissing must not also act on the key.
-        assert!(!app.should_quit);
+        assert_eq!(app.exit, None);
     }
 
     #[test]
@@ -344,9 +385,19 @@ mod tests {
         let mut app = app();
         app.show_help = true;
         handle_key(&mut app, &mut Theme::default(), press(KeyCode::Char('q')));
-        assert!(!app.should_quit, "first press only closes help");
+        assert_eq!(app.exit, None, "first press only closes help");
         handle_key(&mut app, &mut Theme::default(), press(KeyCode::Char('q')));
-        assert!(app.should_quit);
+        assert_eq!(app.exit, Some(Exit::Quit));
+    }
+
+    #[test]
+    fn detaching_while_help_is_open_also_takes_two_presses() {
+        let mut app = app();
+        app.show_help = true;
+        handle_key(&mut app, &mut Theme::default(), press(KeyCode::Char('d')));
+        assert_eq!(app.exit, None);
+        handle_key(&mut app, &mut Theme::default(), press(KeyCode::Char('d')));
+        assert_eq!(app.exit, Some(Exit::Detach));
     }
 
     #[test]
