@@ -2,8 +2,12 @@
 name = "countercow"
 version = "0.1.0"
 edition = "2021"
-description = "A btop-style TUI for .NET runtime counters"
+description = "A btop for .NET: live runtime counters, GC and allocation forensics, and a CPU profiler, in one terminal binary"
 license = "MIT"
+repository = "https://github.com/tbbuck/countercow"
+readme = "README.md"
+keywords = ["dotnet", "tui", "profiler", "diagnostics", "eventpipe"]
+categories = ["command-line-utilities", "development-tools::profiling"]
 
 [dependencies]
 clap = { version = "4", features = ["derive"] }

@@ -1,14 +1,23 @@
 # countercow
 
-A `btop`-style terminal dashboard for .NET runtime counters.
+**A `btop` for .NET.** Live runtime counters, allocation and GC forensics, and a CPU profiler —
+one terminal binary, no .NET install required.
 
-`dotnet-counters` shows you the same data as a flat, scrolling table of name/value pairs — no
+[![MIT licensed](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
+
+`dotnet-counters` shows you the same telemetry as a flat, scrolling table of name/value pairs — no
 history, no shape, no sense of what matters for the kind of app you're looking at. countercow is
-the same gap `btop` closed over `top`.
+the gap `btop` closed over `top`, and then some:
 
-It is a single self-contained Rust binary. **No .NET SDK, no `dotnet-counters`, no managed
-dependency at runtime** — it speaks the .NET Diagnostics IPC and EventPipe protocols directly over
-a Unix socket. Linux and macOS.
+| | |
+|---|---|
+| **Watch** | Live counters with braille history graphs, laid out for the app you attached to. |
+| **Investigate** | *What* is filling the heap, *why* each GC ran, what's throwing, what's blocking. |
+| **Profile** | A five-second CPU profile ranking methods by self time. |
+
+It is a single self-contained Rust binary that speaks the .NET Diagnostics IPC and EventPipe
+protocols directly over a Unix socket — **no .NET SDK, no `dotnet-counters`, no managed dependency
+at runtime**. Works against .NET 6 through 10, on Linux and macOS.
 
 ```
 ┌ Heap size — 25.7 MiB ──────────────────────────────────┐┌ Memory ────────────┐
@@ -206,3 +215,18 @@ dotnet run --project testapps/aspnet-sample -f net10.0 -- --urls http://localhos
 scripts/drive-load.sh http://localhost:5199 20
 countercow --name CounterCowSampleApi
 ```
+
+## Licence
+
+MIT — see [LICENSE](LICENSE).
+
+countercow is an independent reimplementation of protocols Microsoft documents and implements in
+the open. Nothing here is copied, but the wire formats were derived by reading, and verified
+against, these MIT-licensed projects — credit where it is due:
+
+- [dotnet/diagnostics](https://github.com/dotnet/diagnostics) — the Diagnostics IPC protocol spec
+  and the reference client this one is modelled on.
+- [microsoft/perfview](https://github.com/microsoft/perfview) — where the nettrace format is
+  actually specified, and the TraceEvent reader that settles what the spec leaves ambiguous.
+- [dotnet/runtime](https://github.com/dotnet/runtime) — the writer, which is the final authority
+  whenever the two disagree.
