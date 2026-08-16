@@ -1,14 +1,12 @@
-mod counters;
-mod ipc;
-mod nettrace;
-
 use std::ops::ControlFlow;
 use std::time::Instant;
 
 use clap::{Parser, Subcommand};
 use color_eyre::eyre::{bail, Result};
 
-use ipc::discovery::{self, DotnetProcess};
+use countercow::counters;
+use countercow::ipc;
+use countercow::ipc::discovery::{self, DotnetProcess};
 
 #[derive(Parser)]
 #[command(name = "countercow", version, about = "A btop-style TUI for .NET runtime counters")]
