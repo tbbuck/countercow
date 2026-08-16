@@ -6,6 +6,7 @@
 
 pub mod chart;
 pub mod dashboard;
+pub mod investigate;
 pub mod panels;
 pub mod picker;
 pub mod theme;
@@ -19,10 +20,11 @@ use crossbeam_channel::{bounded, Receiver, Sender};
 use crossterm::event::{Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
 use ratatui::DefaultTerminal;
 
-use crate::app::{App, AppEvent, Exit, Status};
+use crate::app::{App, AppEvent, Exit, Status, View};
 use crate::counters::session;
 use crate::ipc::commands::{self, ProcessInfo};
 use crate::ipc::discovery::{self, DotnetProcess};
+use crate::runtime::session as runtime_session;
 
 use picker::{Entry, Picker};
 use theme::Theme;
@@ -166,11 +168,12 @@ fn run_dashboard(
     let stop = Arc::new(AtomicBool::new(false));
 
     spawn_input_reader(tx.clone(), Arc::clone(&stop));
+    let tx_for_runtime = tx.clone();
     spawn_session_reader(session.stream, interval, tx, Arc::clone(&stop));
 
     let mut app = App::new(process, info, interval);
     let mut theme = Theme::default();
-    let result = event_loop(terminal, &mut app, &mut theme, &rx);
+    let result = event_loop(terminal, &mut app, &mut theme, &rx, &tx_for_runtime, &socket);
 
     // Close the session properly rather than letting the socket drop, so the runtime tears down
     // its EventPipe session promptly. This matters more now that detaching is possible: leaking
@@ -233,31 +236,111 @@ fn spawn_session_reader(
     });
 }
 
+/// A live investigation session, tracked so it can be closed the moment the user leaves.
+struct Investigation {
+    session_id: u64,
+    stop: Arc<AtomicBool>,
+}
+
 fn event_loop(
     terminal: &mut DefaultTerminal,
     app: &mut App,
     theme: &mut Theme,
     rx: &Receiver<AppEvent>,
+    tx: &Sender<AppEvent>,
+    socket: &std::path::Path,
 ) -> Result<()> {
-    loop {
-        terminal.draw(|frame| dashboard::render(frame, app, theme))?;
+    let mut investigation: Option<Investigation> = None;
 
-        // Block for the next event, then absorb everything else already queued. A full interval
-        // delivers ~40 samples at once; redrawing per sample would be wasted work.
-        match rx.recv_timeout(FRAME_INTERVAL) {
-            Ok(event) => handle_event(app, theme, event),
-            Err(crossbeam_channel::RecvTimeoutError::Timeout) => {}
-            // Both producers are gone; nothing further can arrive.
-            Err(crossbeam_channel::RecvTimeoutError::Disconnected) => return Ok(()),
-        }
-        while let Ok(event) = rx.try_recv() {
-            handle_event(app, theme, event);
-        }
+    let result = (|| -> Result<()> {
+        loop {
+            terminal.draw(|frame| match app.view {
+                View::Dashboard => dashboard::render(frame, app, theme),
+                View::Investigate => investigate::render(frame, app, theme),
+            })?;
 
-        if app.exit.is_some() {
-            return Ok(());
+            // Block for the next event, then absorb everything else already queued. A full
+            // interval delivers ~40 samples at once, and an investigation session delivers far
+            // more; redrawing per event would be wasted work.
+            match rx.recv_timeout(FRAME_INTERVAL) {
+                Ok(event) => handle_event(app, theme, event),
+                Err(crossbeam_channel::RecvTimeoutError::Timeout) => {}
+                // Both producers are gone; nothing further can arrive.
+                Err(crossbeam_channel::RecvTimeoutError::Disconnected) => return Ok(()),
+            }
+            while let Ok(event) = rx.try_recv() {
+                handle_event(app, theme, event);
+            }
+
+            // Reconcile the session with the screen. Runtime events cost the target real CPU, so
+            // the session exists only while the user is looking at it.
+            match (app.is_investigating(), investigation.is_some()) {
+                (true, false) => investigation = start_investigation(app, tx, socket),
+                (false, true) => stop_investigation(&mut investigation, socket),
+                _ => {}
+            }
+
+            if app.exit.is_some() {
+                return Ok(());
+            }
         }
-    }
+    })();
+
+    stop_investigation(&mut investigation, socket);
+    result
+}
+
+fn start_investigation(
+    app: &mut App,
+    tx: &Sender<AppEvent>,
+    socket: &std::path::Path,
+) -> Option<Investigation> {
+    let session = match runtime_session::start(socket) {
+        Ok(session) => session,
+        Err(e) => {
+            app.runtime_error = Some(e.to_string());
+            return None;
+        }
+    };
+
+    let session_id = session.session_id;
+    let stop = Arc::new(AtomicBool::new(false));
+    spawn_runtime_reader(session.stream, tx.clone(), Arc::clone(&stop));
+    Some(Investigation { session_id, stop })
+}
+
+fn stop_investigation(investigation: &mut Option<Investigation>, socket: &std::path::Path) {
+    let Some(active) = investigation.take() else {
+        return;
+    };
+    active.stop.store(true, Ordering::Relaxed);
+    // Best effort: the process may have exited, which is not worth reporting here.
+    let _ = runtime_session::stop(socket, active.session_id);
+}
+
+fn spawn_runtime_reader(
+    stream: std::os::unix::net::UnixStream,
+    tx: Sender<AppEvent>,
+    stop: Arc<AtomicBool>,
+) {
+    std::thread::spawn(move || {
+        let sender = tx.clone();
+        let result = runtime_session::run(stream, |event, qpc_frequency| {
+            if stop.load(Ordering::Relaxed)
+                || sender.send(AppEvent::Runtime(Box::new(event), qpc_frequency)).is_err()
+            {
+                return ControlFlow::Break(());
+            }
+            ControlFlow::Continue(())
+        });
+
+        // A read error after we asked to stop is just the socket closing under us.
+        if let Err(e) = result {
+            if !stop.load(Ordering::Relaxed) {
+                let _ = tx.send(AppEvent::RuntimeFailed(e.to_string()));
+            }
+        }
+    });
 }
 
 fn handle_event(app: &mut App, theme: &mut Theme, event: AppEvent) {
@@ -269,6 +352,8 @@ fn handle_event(app: &mut App, theme: &mut Theme, event: AppEvent) {
                 None => Status::Ended,
             };
         }
+        AppEvent::Runtime(event, qpc_frequency) => app.record_runtime(*event, qpc_frequency),
+        AppEvent::RuntimeFailed(error) => app.runtime_error = Some(error),
         AppEvent::Input(Event::Key(key)) if key.kind == KeyEventKind::Press => {
             handle_key(app, theme, key);
         }
@@ -286,12 +371,29 @@ fn handle_key(app: &mut App, theme: &mut Theme, key: KeyEvent) {
         return;
     }
 
+    // Escape backs out of the investigation screen rather than quitting outright.
+    if app.is_investigating() {
+        match key.code {
+            KeyCode::Char('i') | KeyCode::Esc => app.toggle_investigate(),
+            KeyCode::Char('r') => app.runtime.reset(),
+            KeyCode::Char('q') => app.exit = Some(Exit::Quit),
+            KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                app.exit = Some(Exit::Quit);
+            }
+            KeyCode::Char('d') => app.exit = Some(Exit::Detach),
+            KeyCode::Char('?') | KeyCode::Char('h') => app.show_help = true,
+            _ => {}
+        }
+        return;
+    }
+
     match key.code {
         KeyCode::Char('q') | KeyCode::Esc => app.exit = Some(Exit::Quit),
         KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => {
             app.exit = Some(Exit::Quit);
         }
         KeyCode::Char('d') => app.exit = Some(Exit::Detach),
+        KeyCode::Char('i') => app.toggle_investigate(),
         KeyCode::Char('p') | KeyCode::Char(' ') => app.paused = !app.paused,
         KeyCode::Char('m') => theme.toggle_marker(),
         KeyCode::Char('?') | KeyCode::Char('h') => app.show_help = true,

@@ -113,6 +113,8 @@ fn render_footer(frame: &mut Frame, area: Rect, app: &App, theme: &Theme) {
         Span::from(" quit  ").fg(theme.dim),
         Span::from("d").fg(theme.accent),
         Span::from(" detach  ").fg(theme.dim),
+        Span::from("i").fg(theme.accent),
+        Span::from(" investigate  ").fg(theme.dim),
         Span::from("p").fg(theme.accent),
         Span::from(" pause  ").fg(theme.dim),
         Span::from("m").fg(theme.accent),
@@ -302,12 +304,18 @@ fn render_help(frame: &mut Frame, area: Rect, theme: &Theme) {
         Line::from(""),
         Line::from("  q / Esc   quit"),
         Line::from("  d         detach and pick another process"),
+        Line::from("  i         investigate: allocations, GC causes, exceptions"),
         Line::from("  p         pause history (session keeps running)"),
         Line::from("  m         switch braille / octant plotting"),
         Line::from("  ?         toggle this help"),
         Line::from(""),
         Line::from(Span::from("  Panels appear once their provider reports.").fg(theme.dim)),
         Line::from(Span::from("  ASP.NET panels are hidden for other processes.").fg(theme.dim)),
+        Line::from(""),
+        Line::from(
+            Span::from("  Investigating costs the target process CPU, so it runs").fg(theme.dim),
+        ),
+        Line::from(Span::from("  only while that screen is open.").fg(theme.dim)),
     ];
 
     let width = 52.min(area.width.saturating_sub(4));

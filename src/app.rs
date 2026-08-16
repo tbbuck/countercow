@@ -7,6 +7,8 @@ use crate::counters::catalog;
 use crate::counters::sample::CounterSample;
 use crate::ipc::commands::ProcessInfo;
 use crate::ipc::discovery::DotnetProcess;
+use crate::runtime::session::RuntimeEvent;
+use crate::runtime::state::RuntimeState;
 
 /// Samples retained per counter. At the default one-second interval this is ten minutes.
 pub const HISTORY_CAPACITY: usize = 600;
@@ -21,6 +23,18 @@ pub enum AppEvent {
     Sample(Box<CounterSample>),
     /// The counter session finished; `Some` carries the failure that ended it.
     SessionEnded(Option<String>),
+    /// A decoded runtime event, with the clock frequency needed to scale pause durations.
+    Runtime(Box<RuntimeEvent>, i64),
+    /// The investigation session could not start, or ended unexpectedly.
+    RuntimeFailed(String),
+}
+
+/// Which screen is showing.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum View {
+    Dashboard,
+    /// Runtime events: allocations, collections, exceptions, contention.
+    Investigate,
 }
 
 /// How a dashboard session ended.
@@ -71,6 +85,12 @@ pub struct App {
     pub show_help: bool,
     /// Set once the user asks to leave this dashboard, and how.
     pub exit: Option<Exit>,
+    pub view: View,
+    /// Accumulated runtime events. Only populated while investigating.
+    pub runtime: RuntimeState,
+    pub runtime_error: Option<String>,
+    /// When the current investigation session began.
+    investigating_since: Option<Instant>,
     started: Instant,
     pub last_sample_at: Option<Instant>,
     /// Counts every sample received, so the footer can show the session is alive.
@@ -89,6 +109,10 @@ impl App {
             paused: false,
             show_help: false,
             exit: None,
+            view: View::Dashboard,
+            runtime: RuntimeState::new(),
+            runtime_error: None,
+            investigating_since: None,
             started: Instant::now(),
             last_sample_at: None,
             samples_seen: 0,
@@ -156,6 +180,48 @@ impl App {
 
     pub fn uptime(&self) -> Duration {
         self.started.elapsed()
+    }
+
+    /// Enter or leave the investigation screen.
+    ///
+    /// Leaving keeps what was gathered, so flicking back and forth does not throw the findings
+    /// away; the session itself is stopped by the event loop, which is what actually costs the
+    /// target process.
+    pub fn toggle_investigate(&mut self) {
+        self.view = match self.view {
+            View::Dashboard => {
+                self.runtime_error = None;
+                self.investigating_since = Some(Instant::now());
+                View::Investigate
+            }
+            View::Investigate => View::Dashboard,
+        };
+    }
+
+    pub fn is_investigating(&self) -> bool {
+        self.view == View::Investigate
+    }
+
+    pub fn investigating_for(&self) -> Duration {
+        self.investigating_since.map(|at| at.elapsed()).unwrap_or_default()
+    }
+
+    /// Fold a decoded runtime event into the investigation state.
+    pub fn record_runtime(&mut self, event: RuntimeEvent, qpc_frequency: i64) {
+        match event {
+            RuntimeEvent::Allocation(tick) => {
+                self.runtime.record_allocation(tick.type_name, tick.amount, tick.kind)
+            }
+            RuntimeEvent::GcStart(start) => self.runtime.record_gc_start(start),
+            RuntimeEvent::GcEnd => self.runtime.record_gc_end(),
+            RuntimeEvent::HeapStats(stats) => self.runtime.record_heap_stats(stats),
+            RuntimeEvent::SuspendBegin { timestamp } => self.runtime.record_suspend(timestamp),
+            RuntimeEvent::RestartEnd { timestamp } => {
+                self.runtime.record_restart(timestamp, qpc_frequency)
+            }
+            RuntimeEvent::Exception(thrown) => self.runtime.record_exception(thrown),
+            RuntimeEvent::Contention(stop) => self.runtime.record_contention(stop),
+        }
     }
 
     /// True when samples have stopped arriving for noticeably longer than the interval.

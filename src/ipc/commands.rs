@@ -2,7 +2,6 @@
 //! EventPipe counter session.
 
 use std::fmt;
-use std::io::Read;
 use std::os::unix::net::UnixStream;
 use std::path::Path;
 
@@ -222,8 +221,11 @@ pub fn start_tracing(socket: &Path, config: &TraceConfig) -> Result<TraceSession
 /// Stop a session. This must go out on a *new* connection — the protocol allows one command per
 /// connection.
 ///
-/// The runtime then finishes writing into the original stream before closing it, so the caller
-/// must keep draining that stream to EOF rather than dropping it here.
+/// The runtime then finishes writing into the *original* stream before closing it, so the caller
+/// must keep draining that stream to EOF. Crucially, that draining has to continue **while** this
+/// call is in flight: if the streaming socket's buffer fills, the runtime blocks writing to it and
+/// never gets to process the stop, so a caller that pauses its reader to call this deadlocks.
+/// Issue it from another thread, or after arranging for the stream to keep being read.
 pub fn stop_tracing(socket: &Path, session_id: u64) -> Result<()> {
     let mut stream = connect(socket)?;
     let mut w = PayloadWriter::new();
@@ -235,9 +237,8 @@ pub fn stop_tracing(socket: &Path, session_id: u64) -> Result<()> {
         &w.into_bytes(),
     )?;
     frame::read_response(&mut stream)?;
-
-    // Drain politely; the runtime closes this connection itself.
-    let _ = stream.read(&mut [0u8; 32]);
+    // Dropping the stream closes this connection. Do not read from it further: a blocking read
+    // here is one of the ways to produce the deadlock described above.
     Ok(())
 }
 

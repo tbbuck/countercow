@@ -7,8 +7,11 @@
 //! Capture from as many .NET versions as you can; metadata tag usage differs between them.
 //!
 //! ```text
-//! cargo run --example capture -- <pid> <output-path> [seconds]
+//! cargo run --example capture -- <pid> <output-path> [seconds] [counters|runtime]
 //! ```
+//!
+//! `counters` (the default) captures the EventCounter session the dashboard uses; `runtime`
+//! captures the manifest-based GC/exception/contention session the investigation screen uses.
 
 use std::io::{Read, Write};
 use std::time::{Duration, Instant};
@@ -21,6 +24,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let pid: u32 = args.next().ok_or("usage: capture <pid> <output> [seconds]")?.parse()?;
     let output = args.next().ok_or("usage: capture <pid> <output> [seconds]")?;
     let seconds: u64 = args.next().unwrap_or_else(|| "3".into()).parse()?;
+    let kind = args.next().unwrap_or_else(|| "counters".into());
 
     let found = discovery::discover()?;
     let process = found
@@ -31,22 +35,37 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let info = commands::process_info(&process.socket)?;
     println!(
-        "capturing {}s from {} (pid {}, {})",
+        "capturing {}s of {kind} from {} (pid {}, {})",
         seconds,
         process.name,
         pid,
         info.framework_label().unwrap_or_else(|| "unknown".into())
     );
 
-    let session = commands::start_tracing(&process.socket, &trace_config(1.0))?;
+    let config = match kind.as_str() {
+        "runtime" => countercow::runtime::session::trace_config(),
+        _ => trace_config(1.0),
+    };
+    let session = commands::start_tracing(&process.socket, &config)?;
     let mut stream = session.stream;
     // Short timeout so the deadline is checked even while the runtime is idle between intervals.
     stream.set_read_timeout(Some(Duration::from_millis(200)))?;
 
+    // Stop from another thread, so this one never pauses its reading. If the streaming socket's
+    // buffer fills while we are blocked issuing the stop, the runtime blocks writing to it and
+    // never processes the stop — a deadlock that only shows up on high-volume sessions.
+    let stop_socket = process.socket.clone();
+    let session_id = session.session_id;
+    std::thread::spawn(move || {
+        std::thread::sleep(Duration::from_secs(seconds));
+        let _ = commands::stop_tracing(&stop_socket, session_id);
+    });
+
     let mut captured = Vec::new();
-    let deadline = Instant::now() + Duration::from_secs(seconds);
+    // Well beyond the flush of a stopped session, but bounded so a wedged runtime cannot hang
+    // the capture forever.
+    let hard_deadline = Instant::now() + Duration::from_secs(seconds + 30);
     let mut chunk = [0u8; 64 * 1024];
-    let mut stopped = false;
 
     loop {
         match stream.read(&mut chunk) {
@@ -60,11 +79,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             Err(e) => return Err(e.into()),
         }
 
-        if !stopped && Instant::now() >= deadline {
-            // Stop goes out on a second connection; the runtime then finishes writing into this
-            // one, so we keep reading until it closes.
-            commands::stop_tracing(&process.socket, session.session_id)?;
-            stopped = true;
+        if Instant::now() >= hard_deadline {
+            eprintln!("warning: stream did not close; capture may be truncated");
+            break;
         }
     }
 

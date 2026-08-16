@@ -4,7 +4,7 @@
 //! reviewable in a diff.
 //!
 //! ```text
-//! cargo run --example preview -- [aspnet|generic] [width] [height]
+//! cargo run --example preview -- [aspnet|generic|loaded|console|investigate] [width] [height]
 //! ```
 
 use countercow::app::App;
@@ -12,8 +12,9 @@ use countercow::counters::sample;
 use countercow::ipc::commands::ProcessInfo;
 use countercow::ipc::discovery::DotnetProcess;
 use countercow::nettrace::blocks::NettraceParser;
-use countercow::ui::dashboard;
+use countercow::runtime::session as runtime_session;
 use countercow::ui::theme::Theme;
+use countercow::ui::{dashboard, investigate};
 
 use ratatui::backend::TestBackend;
 use ratatui::Terminal;
@@ -22,6 +23,7 @@ const ASPNET: &[u8] = include_bytes!("../tests/fixtures/aspnet-net9.nettrace");
 const GENERIC: &[u8] = include_bytes!("../tests/fixtures/generic-net10.nettrace");
 const LOADED: &[u8] = include_bytes!("../tests/fixtures/aspnet-net10-loaded.nettrace");
 const CONSOLE: &[u8] = include_bytes!("../tests/fixtures/console-net8.nettrace");
+const RUNTIME: &[u8] = include_bytes!("../tests/fixtures/runtime-net10-loaded.nettrace");
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut args = std::env::args().skip(1);
@@ -51,21 +53,38 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     };
 
     let mut app = App::new(process, info, 1.0);
-    let mut parser = NettraceParser::new(std::io::Cursor::new(fixture))?;
-    while let Some(batch) = parser.next_events()? {
-        for event in batch {
-            let Some(metadata) = parser.metadata().get(event.metadata_id) else {
-                continue;
-            };
-            if let Some(s) = sample::extract(metadata, &event)? {
-                app.record(s);
+    let investigating = which == "investigate";
+
+    if investigating {
+        // Replay a captured runtime session through the same path the live one uses.
+        app.toggle_investigate();
+        runtime_session::run(std::io::Cursor::new(RUNTIME), |event, qpc| {
+            app.record_runtime(event, qpc);
+            std::ops::ControlFlow::Continue(())
+        })?;
+    } else {
+        let mut parser = NettraceParser::new(std::io::Cursor::new(fixture))?;
+        while let Some(batch) = parser.next_events()? {
+            for event in batch {
+                let Some(metadata) = parser.metadata().get(event.metadata_id) else {
+                    continue;
+                };
+                if let Some(s) = sample::extract(metadata, &event)? {
+                    app.record(s);
+                }
             }
         }
     }
 
     let mut terminal = Terminal::new(TestBackend::new(width, height))?;
     let theme = Theme::default();
-    terminal.draw(|frame| dashboard::render(frame, &app, &theme))?;
+    terminal.draw(|frame| {
+        if investigating {
+            investigate::render(frame, &app, &theme);
+        } else {
+            dashboard::render(frame, &app, &theme);
+        }
+    })?;
 
     let buffer = terminal.backend().buffer();
     for y in 0..buffer.area.height {

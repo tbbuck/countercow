@@ -35,12 +35,41 @@ countercow ps              # list attachable processes and exit
 |---|---|
 | `q` / `Esc` | quit |
 | `d` | detach and pick another process |
+| `i` | investigate: allocations, GC causes, exceptions, contention |
 | `p` | pause history (the session keeps running) |
 | `m` | switch braille / octant plotting |
 | `?` | help |
 
 Detaching closes the EventPipe session properly and re-discovers processes, so it picks up
 anything that has started since — handy when the thing you want to watch is still building.
+
+## Investigating
+
+Counters tell you *that* the heap is growing. `i` tells you *what* is growing it:
+
+```
+┌ Allocations by type ──────────────────────────────┐┌ Collections ─────────────────┐
+│System.Byte[]                    LOH  228.0 MiB 97.9%││#251  gen2 large alloc  4.0 ms│
+│System.String                    SOH  520.5 KiB  0.2%││#250  gen2 large alloc  4.3 ms│
+│System.IO.Pipelines.Pipe         SOH  312.5 KiB  0.1%││#249  gen2 large alloc  4.2 ms│
+└─────────────────────────────────────────────────────┘└──────────────────────────────┘
+┌ Exceptions thrown ────────────────────────────────┐┌ Lock contention ─────────────┐
+│System.InvalidOperationException  sample failure 1,425││Waits                      1  │
+└─────────────────────────────────────────────────────┘└──────────────────────────────┘
+```
+
+That reads as one causal story: byte arrays are going to the large object heap, which is forcing
+gen 2 collections, at ~4 ms of pause each.
+
+This opens a **second** EventPipe session carrying `Microsoft-Windows-DotNETRuntime` events, and
+unlike counters it costs the target real CPU — counters arrive at roughly 40 events/second, where
+the GC keyword alone produced ~1,600/second on a loaded app. So the session exists only while that
+screen is open, and is closed the moment you leave. Findings are kept when you flick back to the
+dashboard; `r` clears them.
+
+Allocation counts are *sampled* — the runtime emits a tick roughly every 100 KB of small-object
+allocation, and per large-object allocation — so treat the byte totals as a good estimate of where
+pressure comes from rather than an exact ledger.
 
 ## What it shows
 
@@ -72,6 +101,7 @@ Three layers, bottom-up:
 | `src/ipc/` | The Diagnostics IPC protocol: socket discovery, message framing, `ProcessInfo`, `CollectTracing2`. Ported from `dotnet/diagnostics`. |
 | `src/nettrace/` | The nettrace V4 stream format with V5 metadata tags — FastSerializer framing, block dispatch, compressed event headers, metadata and payload decoding. |
 | `src/counters/` | Turning `EventCounters` events into samples, and knowing how to present them. |
+| `src/runtime/` | The investigation session: GC, allocation, exception and contention events. |
 
 Counter display names and units are read off the wire rather than from a table, because the
 runtime sends them in every payload — and because the table that used to hold them
@@ -92,8 +122,13 @@ reading the code:
   block. Treating it like the others desynchronises the whole stream.
 - **V1 and V2 metadata field lists are ordered oppositely** — type-then-name versus
   size-then-name-then-type.
-- **After `StopTracing` you must keep draining the original socket.** The runtime writes rundown
-  into it before closing.
+- **After `StopTracing` you must keep draining the original socket** — *while the stop is in
+  flight*, not just afterwards. If the streaming socket's buffer fills, the runtime blocks writing
+  to it and never processes the stop, so a caller that pauses its reader to issue the stop
+  deadlocks. Only shows up on high-volume sessions.
+- **`Microsoft-Windows-DotNETRuntime` is manifest-based**, so unlike EventSource providers it
+  sends no event names and no field lists — only a numeric id. Its payloads can only be decoded
+  from schemas hardcoded per `(id, version)`.
 
 v1 reads EventCounters, which work unchanged from .NET 6 through .NET 10. The newer
 `System.Diagnostics.Metrics` meters arrived piecemeal (ASP.NET Core in .NET 8, `System.Runtime`

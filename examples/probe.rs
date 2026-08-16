@@ -121,7 +121,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut parser = NettraceParser::new(BlockingRead(session.stream))?;
     let mut stats: BTreeMap<String, EventStats> = BTreeMap::new();
     let mut total = 0usize;
-    let mut raw_dumped = 0usize;
+    let mut raw_seen: BTreeMap<i32, usize> = BTreeMap::new();
 
     while let Ok(Some(batch)) = parser.next_events() {
         for event in batch {
@@ -132,13 +132,18 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             // providers send no schema, so the only way to confirm a hardcoded layout is to look
             // at the bytes.
             if let Some(filter) = &filter {
-                match filter.parse::<i32>() {
-                    Ok(wanted) => {
-                        if metadata.event_id != wanted {
+                // A comma-separated list of event ids selects those and dumps raw payloads.
+                let wanted_ids: Vec<i32> =
+                    filter.split(',').filter_map(|part| part.trim().parse().ok()).collect();
+                match wanted_ids.is_empty() {
+                    false => {
+                        if !wanted_ids.contains(&metadata.event_id) {
                             continue;
                         }
-                        if raw_dumped < 3 {
-                            raw_dumped += 1;
+                        // A couple of samples per id is enough to confirm a layout.
+                        let seen = raw_seen.entry(metadata.event_id).or_insert(0);
+                        if *seen < 2 {
+                            *seen += 1;
                             println!(
                                 "id {} v{} — {} payload bytes",
                                 metadata.event_id,
@@ -152,7 +157,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                             println!();
                         }
                     }
-                    Err(_) => {
+                    true => {
                         if !metadata.event_name.contains(filter.as_str()) {
                             continue;
                         }
@@ -200,7 +205,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     );
 
     let mut by_count: Vec<_> = stats.iter().collect();
-    by_count.sort_by(|a, b| b.1.count.cmp(&a.1.count));
+    by_count.sort_by_key(|(_, stat)| std::cmp::Reverse(stat.count));
 
     for (name, stat) in by_count {
         let rate = stat.count as f64 / started.elapsed().as_secs_f64();
