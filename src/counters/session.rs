@@ -41,6 +41,9 @@ pub const ASPNET_PROVIDERS: &[&str] =
 pub fn trace_config(interval_secs: f64) -> TraceConfig {
     TraceConfig {
         circular_buffer_mb: CIRCULAR_BUFFER_MB,
+        // Rundown emits method/assembly/type maps: pure overhead for counters, and
+        // dotnet-counters itself asks for none.
+        request_rundown: false,
         providers: PROVIDERS
             .iter()
             .map(|name| Provider {

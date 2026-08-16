@@ -98,6 +98,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let config = TraceConfig {
         // GC events are far higher volume than counters, so give the runtime real headroom.
         circular_buffer_mb: 256,
+        request_rundown: false,
         providers: vec![Provider {
             name: provider_name.clone(),
             keywords,

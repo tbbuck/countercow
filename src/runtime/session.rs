@@ -37,6 +37,8 @@ pub enum RuntimeEvent {
 pub fn trace_config() -> TraceConfig {
     TraceConfig {
         circular_buffer_mb: CIRCULAR_BUFFER_MB,
+        // These events carry their own detail; no method maps are needed to read them.
+        request_rundown: false,
         providers: vec![Provider {
             name: RUNTIME_PROVIDER.to_owned(),
             keywords: keyword::GC | keyword::CONTENTION | keyword::EXCEPTION,

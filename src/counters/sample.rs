@@ -195,7 +195,7 @@ mod tests {
 
         (
             metadata("System.Runtime", EVENT_COUNTERS, fields),
-            RawEvent { metadata_id: 1, timestamp: 500, payload },
+            RawEvent { metadata_id: 1, timestamp: 500, stack_id: 0, payload },
         )
     }
 
@@ -225,7 +225,7 @@ mod tests {
 
         (
             metadata("System.Runtime", EVENT_COUNTERS, fields),
-            RawEvent { metadata_id: 1, timestamp: 900, payload },
+            RawEvent { metadata_id: 1, timestamp: 900, stack_id: 0, payload },
         )
     }
 
@@ -275,7 +275,7 @@ mod tests {
     #[test]
     fn ignores_events_that_are_not_counters() {
         let md = metadata("System.Runtime", "GCStart", vec![]);
-        let event = RawEvent { metadata_id: 1, timestamp: 0, payload: vec![] };
+        let event = RawEvent { metadata_id: 1, timestamp: 0, stack_id: 0, payload: vec![] };
         assert!(extract(&md, &event).unwrap().is_none());
     }
 

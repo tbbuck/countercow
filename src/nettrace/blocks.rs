@@ -37,6 +37,9 @@ impl TraceInfo {
 pub struct RawEvent {
     pub metadata_id: u32,
     pub timestamp: u64,
+    /// Index into the stack table, or 0 when the event carries no stack. Resolving it needs
+    /// StackBlock parsing, which is only worthwhile for a sampling profiler.
+    pub stack_id: u32,
     pub payload: Vec<u8>,
 }
 
@@ -58,6 +61,9 @@ pub struct NettraceParser<R: Read> {
     metadata: MetadataStore,
     trace: TraceInfo,
     finished: bool,
+    /// Blocks seen by type name. Diagnostic only — useful for confirming what a provider
+    /// actually sends, since skipped block types are otherwise invisible.
+    block_counts: std::collections::BTreeMap<String, usize>,
 }
 
 impl<R: Read> NettraceParser<R> {
@@ -70,7 +76,13 @@ impl<R: Read> NettraceParser<R> {
             metadata: MetadataStore::new(),
             trace: TraceInfo::default(),
             finished: false,
+            block_counts: Default::default(),
         })
+    }
+
+    /// How many blocks of each type have been seen.
+    pub fn block_counts(&self) -> &std::collections::BTreeMap<String, usize> {
+        &self.block_counts
     }
 
     pub fn metadata(&self) -> &MetadataStore {
@@ -95,6 +107,8 @@ impl<R: Read> NettraceParser<R> {
                 self.finished = true;
                 return Ok(None);
             };
+
+            *self.block_counts.entry(header.type_name.clone()).or_default() += 1;
 
             match header.type_name.as_str() {
                 "Trace" | "Microsoft.DotNet.Runtime.EventPipeFile" => {
@@ -210,6 +224,7 @@ fn parse_event_rows(content: &[u8]) -> Result<Vec<RawEvent>> {
         events.push(RawEvent {
             metadata_id: header.metadata_id,
             timestamp: header.timestamp,
+            stack_id: header.stack_id,
             payload: payload.to_vec(),
         });
     }

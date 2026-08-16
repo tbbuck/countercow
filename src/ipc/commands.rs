@@ -167,6 +167,11 @@ pub struct Provider {
 pub struct TraceConfig {
     pub circular_buffer_mb: u32,
     pub providers: Vec<Provider>,
+    /// Ask the runtime to emit method, assembly and type maps when the session stops.
+    ///
+    /// Pure overhead for counters, but it is the only way to turn a stack frame's address into a
+    /// method name — and note it arrives at *stop*, not while the session runs.
+    pub request_rundown: bool,
 }
 
 /// NetTrace. The alternative (NetPerf V3 = 0) is still accepted by the runtime but is not
@@ -178,9 +183,7 @@ impl TraceConfig {
         let mut w = PayloadWriter::new();
         w.u32(self.circular_buffer_mb)
             .u32(FORMAT_NETTRACE)
-            // Rundown emits method/assembly/type maps: pure overhead for counters, and
-            // dotnet-counters itself asks for none.
-            .bool(false)
+            .bool(self.request_rundown)
             .u32(self.providers.len() as u32);
 
         for provider in &self.providers {
@@ -303,6 +306,7 @@ mod tests {
     fn trace_payload_matches_the_worked_example() {
         let config = TraceConfig {
             circular_buffer_mb: 256,
+            request_rundown: false,
             providers: vec![Provider {
                 name: "System.Runtime".into(),
                 keywords: 0,
