@@ -11,5 +11,6 @@ pub mod app;
 pub mod counters;
 pub mod ipc;
 pub mod nettrace;
+pub mod profile;
 pub mod runtime;
 pub mod ui;

@@ -44,6 +44,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let config = match kind.as_str() {
         "runtime" => countercow::runtime::session::trace_config(),
+        "profile" => countercow::profile::session::trace_config(),
         _ => trace_config(1.0),
     };
     let session = commands::start_tracing(&process.socket, &config)?;

@@ -9,6 +9,7 @@ pub mod dashboard;
 pub mod investigate;
 pub mod panels;
 pub mod picker;
+pub mod profile;
 pub mod theme;
 
 use std::ops::ControlFlow;
@@ -20,10 +21,12 @@ use crossbeam_channel::{bounded, Receiver, Sender};
 use crossterm::event::{Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
 use ratatui::DefaultTerminal;
 
-use crate::app::{App, AppEvent, Exit, Status, View};
+use crate::app::{self, App, AppEvent, Exit, Status, View};
 use crate::counters::session;
 use crate::ipc::commands::{self, ProcessInfo};
 use crate::ipc::discovery::{self, DotnetProcess};
+use crate::profile::run as profile_run;
+use crate::profile::session as profile_session;
 use crate::runtime::session as runtime_session;
 
 use picker::{Entry, Picker};
@@ -251,12 +254,14 @@ fn event_loop(
     socket: &std::path::Path,
 ) -> Result<()> {
     let mut investigation: Option<Investigation> = None;
+    let mut profiling: Option<Investigation> = None;
 
     let result = (|| -> Result<()> {
         loop {
             terminal.draw(|frame| match app.view {
                 View::Dashboard => dashboard::render(frame, app, theme),
                 View::Investigate => investigate::render(frame, app, theme),
+                View::Profile => profile::render(frame, app, theme),
             })?;
 
             // Block for the next event, then absorb everything else already queued. A full
@@ -280,6 +285,21 @@ fn event_loop(
                 _ => {}
             }
 
+            // A profile is a fixed window: start one when the screen opens, and stop the session
+            // when the window is up — stopping is what makes the method names arrive.
+            match (
+                matches!(app.profile_phase, app::ProfilePhase::Collecting { .. }),
+                profiling.is_some(),
+            ) {
+                (true, false) => profiling = start_profile(app, tx, socket),
+                (false, true) if !app.is_profiling() => stop_profile(&mut profiling, socket),
+                (true, true) if app.profile_window_elapsed() => {
+                    app.profile_phase = app::ProfilePhase::Resolving;
+                    stop_profile(&mut profiling, socket);
+                }
+                _ => {}
+            }
+
             if app.exit.is_some() {
                 return Ok(());
             }
@@ -287,7 +307,54 @@ fn event_loop(
     })();
 
     stop_investigation(&mut investigation, socket);
+    stop_profile(&mut profiling, socket);
     result
+}
+
+fn start_profile(
+    app: &mut App,
+    tx: &Sender<AppEvent>,
+    socket: &std::path::Path,
+) -> Option<Investigation> {
+    let session = match profile_session::start(socket) {
+        Ok(session) => session,
+        Err(e) => {
+            app.profile_phase = app::ProfilePhase::Failed(e.to_string());
+            return None;
+        }
+    };
+
+    let session_id = session.session_id;
+    let stop = Arc::new(AtomicBool::new(false));
+    spawn_profile_reader(session.stream, tx.clone());
+    Some(Investigation { session_id, stop })
+}
+
+fn stop_profile(profiling: &mut Option<Investigation>, socket: &std::path::Path) {
+    let Some(active) = profiling.take() else {
+        return;
+    };
+    active.stop.store(true, Ordering::Relaxed);
+    let _ = profile_session::stop(socket, active.session_id);
+}
+
+/// Collect a profile off-thread.
+///
+/// Parsing tens of thousands of samples and ten thousand method records is fast but not free, and
+/// the dashboard should keep drawing throughout.
+fn spawn_profile_reader(stream: std::os::unix::net::UnixStream, tx: Sender<AppEvent>) {
+    std::thread::spawn(move || {
+        let progress_tx = tx.clone();
+        let result = profile_run::collect(stream, |progress| {
+            let _ = progress_tx.send(AppEvent::ProfileProgress(progress.samples));
+        });
+
+        let message = match result {
+            Ok(profile) => AppEvent::ProfileDone(Box::new(profile)),
+            Err(e) => AppEvent::ProfileFailed(e.to_string()),
+        };
+        let _ = tx.send(message);
+    });
 }
 
 fn start_investigation(
@@ -354,6 +421,11 @@ fn handle_event(app: &mut App, theme: &mut Theme, event: AppEvent) {
         }
         AppEvent::Runtime(event, qpc_frequency) => app.record_runtime(*event, qpc_frequency),
         AppEvent::RuntimeFailed(error) => app.runtime_error = Some(error),
+        AppEvent::ProfileProgress(samples) => app.profile_samples = samples,
+        AppEvent::ProfileDone(result) => app.finish_profile(*result),
+        AppEvent::ProfileFailed(error) => {
+            app.profile_phase = app::ProfilePhase::Failed(error);
+        }
         AppEvent::Input(Event::Key(key)) if key.kind == KeyEventKind::Press => {
             handle_key(app, theme, key);
         }
@@ -367,6 +439,25 @@ fn handle_key(app: &mut App, theme: &mut Theme, key: KeyEvent) {
         app.show_help = false;
         if !matches!(key.code, KeyCode::Char('?')) {
             return;
+        }
+        return;
+    }
+
+    if app.is_profiling() {
+        match key.code {
+            KeyCode::Char('c') if !key.modifiers.contains(KeyModifiers::CONTROL) => {
+                app.cancel_profile();
+            }
+            KeyCode::Esc => app.cancel_profile(),
+            // Re-running is the only way to refresh: a profile is a fixed window, not a stream.
+            KeyCode::Char('r') if !app.profile_collecting() => app.start_profile(),
+            KeyCode::Char('w') if !app.profile_collecting() => app.toggle_profile_waiting(),
+            KeyCode::Char('q') => app.exit = Some(Exit::Quit),
+            KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                app.exit = Some(Exit::Quit);
+            }
+            KeyCode::Char('d') => app.exit = Some(Exit::Detach),
+            _ => {}
         }
         return;
     }
@@ -394,6 +485,7 @@ fn handle_key(app: &mut App, theme: &mut Theme, key: KeyEvent) {
         }
         KeyCode::Char('d') => app.exit = Some(Exit::Detach),
         KeyCode::Char('i') => app.toggle_investigate(),
+        KeyCode::Char('c') => app.start_profile(),
         KeyCode::Char('p') | KeyCode::Char(' ') => app.paused = !app.paused,
         KeyCode::Char('m') => theme.toggle_marker(),
         KeyCode::Char('?') | KeyCode::Char('h') => app.show_help = true,

@@ -7,11 +7,21 @@ use crate::counters::catalog;
 use crate::counters::sample::CounterSample;
 use crate::ipc::commands::ProcessInfo;
 use crate::ipc::discovery::DotnetProcess;
+use crate::profile::run::ProfileResult;
+use crate::profile::state::HotProfile;
 use crate::runtime::session::RuntimeEvent;
 use crate::runtime::state::RuntimeState;
 
 /// Samples retained per counter. At the default one-second interval this is ten minutes.
 pub const HISTORY_CAPACITY: usize = 600;
+
+/// Default CPU profile window. Long enough for a stable picture at ~13,000 samples/second,
+/// short enough not to feel like a wait.
+pub const DEFAULT_PROFILE_SECONDS: u64 = 5;
+
+/// Hot methods retained from a profile — more than fits on screen, so the filter can be toggled
+/// without losing the tail.
+const PROFILE_ROWS: usize = 200;
 
 /// Identifies a counter across providers, since names are only unique within one.
 pub type CounterKey = (String, String);
@@ -27,6 +37,11 @@ pub enum AppEvent {
     Runtime(Box<RuntimeEvent>, i64),
     /// The investigation session could not start, or ended unexpectedly.
     RuntimeFailed(String),
+    /// Samples collected so far in the current profile.
+    ProfileProgress(u64),
+    /// A finished profile: raw samples plus the method table to rank them against.
+    ProfileDone(Box<ProfileResult>),
+    ProfileFailed(String),
 }
 
 /// Which screen is showing.
@@ -35,6 +50,18 @@ pub enum View {
     Dashboard,
     /// Runtime events: allocations, collections, exceptions, contention.
     Investigate,
+    /// A fixed-window CPU profile.
+    Profile,
+}
+
+/// Where a CPU profile has got to. It is not a live view: names only exist once the session ends.
+#[derive(Debug, Clone, PartialEq)]
+pub enum ProfilePhase {
+    Collecting { until: Instant },
+    /// The window is up and the rundown is being read.
+    Resolving,
+    Done,
+    Failed(String),
 }
 
 /// How a dashboard session ended.
@@ -89,6 +116,19 @@ pub struct App {
     /// Accumulated runtime events. Only populated while investigating.
     pub runtime: RuntimeState,
     pub runtime_error: Option<String>,
+    pub profile_phase: ProfilePhase,
+    /// The ranked result currently on screen.
+    pub profile: Option<HotProfile>,
+    /// The raw samples and method table behind it, kept so the ranking can be recomputed when
+    /// the parked-thread filter is toggled — no need to profile again.
+    profile_result: Option<ProfileResult>,
+    /// Samples seen so far, for the progress display.
+    pub profile_samples: u64,
+    /// Whether parked threads are included in the ranking.
+    pub profile_show_waiting: bool,
+    /// How long each profile runs. Fixed rather than open-ended, because the result only exists
+    /// once the window closes.
+    pub profile_seconds: u64,
     /// When the current investigation session began.
     investigating_since: Option<Instant>,
     started: Instant,
@@ -112,6 +152,12 @@ impl App {
             view: View::Dashboard,
             runtime: RuntimeState::new(),
             runtime_error: None,
+            profile_phase: ProfilePhase::Resolving,
+            profile: None,
+            profile_result: None,
+            profile_samples: 0,
+            profile_show_waiting: false,
+            profile_seconds: DEFAULT_PROFILE_SECONDS,
             investigating_since: None,
             started: Instant::now(),
             last_sample_at: None,
@@ -189,12 +235,13 @@ impl App {
     /// target process.
     pub fn toggle_investigate(&mut self) {
         self.view = match self.view {
-            View::Dashboard => {
+            View::Investigate => View::Dashboard,
+            // From anywhere else, including a finished profile, `i` opens the investigation.
+            View::Dashboard | View::Profile => {
                 self.runtime_error = None;
                 self.investigating_since = Some(Instant::now());
                 View::Investigate
             }
-            View::Investigate => View::Dashboard,
         };
     }
 
@@ -204,6 +251,86 @@ impl App {
 
     pub fn investigating_for(&self) -> Duration {
         self.investigating_since.map(|at| at.elapsed()).unwrap_or_default()
+    }
+
+    /// Enter the profile screen and begin a collection window.
+    pub fn start_profile(&mut self) {
+        self.view = View::Profile;
+        self.profile = None;
+        self.profile_samples = 0;
+        self.profile_phase = ProfilePhase::Collecting {
+            until: Instant::now() + Duration::from_secs(self.profile_seconds),
+        };
+    }
+
+    pub fn is_profiling(&self) -> bool {
+        self.view == View::Profile
+    }
+
+    pub fn profile_collecting(&self) -> bool {
+        matches!(self.profile_phase, ProfilePhase::Collecting { .. })
+    }
+
+    /// Show or hide parked threads, re-ranking what is already collected.
+    ///
+    /// No new session is needed: the samples are kept, only the filter changes.
+    pub fn toggle_profile_waiting(&mut self) {
+        self.profile_show_waiting = !self.profile_show_waiting;
+        self.rank_profile();
+    }
+
+    /// Store a finished profile and rank it.
+    pub fn finish_profile(&mut self, result: ProfileResult) {
+        self.profile_result = Some(result);
+        self.profile_phase = ProfilePhase::Done;
+        self.rank_profile();
+    }
+
+    fn rank_profile(&mut self) {
+        self.profile = self.profile_result.as_ref().map(|result| {
+            result.state.hot_methods(&result.methods, PROFILE_ROWS, self.profile_show_waiting)
+        });
+    }
+
+    /// Leave the profile screen, abandoning any collection in flight.
+    pub fn cancel_profile(&mut self) {
+        if self.profile_collecting() {
+            self.profile_phase = ProfilePhase::Failed("cancelled".into());
+        }
+        self.view = View::Dashboard;
+    }
+
+    /// Whether the collection window has elapsed and the session should be stopped.
+    pub fn profile_window_elapsed(&self) -> bool {
+        match self.profile_phase {
+            ProfilePhase::Collecting { until } => Instant::now() >= until,
+            _ => false,
+        }
+    }
+
+    /// Fraction of the collection window elapsed, for the progress bar.
+    pub fn profile_progress(&self) -> f64 {
+        match self.profile_phase {
+            ProfilePhase::Collecting { until } => {
+                let remaining = until.saturating_duration_since(Instant::now()).as_secs_f64();
+                let total = self.profile_seconds as f64;
+                if total <= 0.0 {
+                    1.0
+                } else {
+                    (total - remaining) / total
+                }
+            }
+            _ => 1.0,
+        }
+    }
+
+    pub fn profile_remaining_secs(&self) -> f64 {
+        match self.profile_phase {
+            ProfilePhase::Collecting { until } => {
+                until.saturating_duration_since(Instant::now()).as_secs_f64()
+            }
+            _ => 0.0,
+        }
     }
 
     /// Fold a decoded runtime event into the investigation state.

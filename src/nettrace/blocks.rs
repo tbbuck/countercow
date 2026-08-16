@@ -43,6 +43,42 @@ pub struct RawEvent {
     pub payload: Vec<u8>,
 }
 
+/// Call stacks, keyed by the id events reference.
+///
+/// Two generations are kept. Ids are recycled after a sequence point, so holding every stack
+/// forever means a later definition silently answers for an earlier id. But discarding the
+/// previous generation outright loses every sample that referenced a stack defined just before
+/// the boundary — around a sixth of them, measured. Keeping one generation back, and preferring
+/// the newer definition, gets both right.
+#[derive(Debug, Default)]
+pub struct StackTable {
+    current: std::collections::HashMap<u32, Vec<u64>>,
+    previous: std::collections::HashMap<u32, Vec<u64>>,
+}
+
+impl StackTable {
+    /// Frames for a stack id, innermost first.
+    pub fn get(&self, stack_id: u32) -> Option<&[u64]> {
+        self.current
+            .get(&stack_id)
+            .or_else(|| self.previous.get(&stack_id))
+            .map(Vec::as_slice)
+    }
+
+    pub fn len(&self) -> usize {
+        self.current.len() + self.previous.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.current.is_empty() && self.previous.is_empty()
+    }
+
+    /// Age the current generation out. Called at each sequence point.
+    pub fn rotate(&mut self) {
+        self.previous = std::mem::take(&mut self.current);
+    }
+}
+
 /// Compression flag in an Event/Metadata block header. The runtime sets this unconditionally
 /// for nettrace V4.
 const FLAG_HEADER_COMPRESSION: u16 = 1;
@@ -64,6 +100,10 @@ pub struct NettraceParser<R: Read> {
     /// Blocks seen by type name. Diagnostic only — useful for confirming what a provider
     /// actually sends, since skipped block types are otherwise invisible.
     block_counts: std::collections::BTreeMap<String, usize>,
+    /// Stack collection is off by default: only a profiler needs it, and it is not free.
+    collect_stacks: bool,
+    stacks: StackTable,
+    sequence_point_seen: bool,
 }
 
 impl<R: Read> NettraceParser<R> {
@@ -77,12 +117,37 @@ impl<R: Read> NettraceParser<R> {
             trace: TraceInfo::default(),
             finished: false,
             block_counts: Default::default(),
+            collect_stacks: false,
+            stacks: StackTable::default(),
+            sequence_point_seen: false,
         })
     }
 
     /// How many blocks of each type have been seen.
     pub fn block_counts(&self) -> &std::collections::BTreeMap<String, usize> {
         &self.block_counts
+    }
+
+    /// Start retaining call stacks, so `stack_id` on an event can be resolved.
+    pub fn collect_stacks(&mut self) {
+        self.collect_stacks = true;
+    }
+
+    pub fn stacks(&self) -> &StackTable {
+        &self.stacks
+    }
+
+    /// Whether a sequence point has been passed since this was last called, clearing the flag.
+    ///
+    /// A sequence point means every event before it has been emitted, so buffered samples can be
+    /// resolved — and must be, because the runtime may reuse stack ids afterwards.
+    pub fn take_sequence_point(&mut self) -> bool {
+        std::mem::take(&mut self.sequence_point_seen)
+    }
+
+    /// Age out retained stacks. Call after resolving a sequence point's worth of samples.
+    pub fn rotate_stacks(&mut self) {
+        self.stacks.rotate();
     }
 
     pub fn metadata(&self) -> &MetadataStore {
@@ -131,8 +196,19 @@ impl<R: Read> NettraceParser<R> {
                         self.metadata.insert(metadata::parse(&row.payload)?);
                     }
                 }
-                // Stacks and sequence points carry nothing a counter view needs. They are still
-                // length-prefixed, so skipping is safe.
+                "StackBlock" if self.collect_stacks => {
+                    let content = self.read_block_content()?;
+                    self.expect_end_object()?;
+                    let pointer_size = self.trace.pointer_size.clamp(4, 8) as usize;
+                    parse_stack_block(&content, pointer_size, &mut self.stacks)?;
+                }
+                "SPBlock" => {
+                    self.sequence_point_seen = true;
+                    self.skip_block()?;
+                    self.expect_end_object()?;
+                }
+                // Stacks carry nothing a counter view needs. Blocks are length-prefixed, so
+                // skipping anything unrecognised is safe.
                 _ => {
                     self.skip_block()?;
                     self.expect_end_object()?;
@@ -193,6 +269,37 @@ fn parse_trace(body: &[u8]) -> Result<TraceInfo> {
         processor_count: r.i32()?,
         sampling_rate: r.i32()?,
     })
+}
+
+/// A StackBlock: `FirstId:u32, Count:u32`, then per stack a `u32` byte length followed by that
+/// many bytes of instruction pointers. Ids run consecutively from `FirstId`.
+fn parse_stack_block(content: &[u8], pointer_size: usize, out: &mut StackTable) -> Result<()> {
+    let mut r = Reader::new(content);
+    let first_id = r.u32()?;
+    let count = r.u32()?;
+
+    for index in 0..count {
+        let size_bytes = r.u32()? as usize;
+        if !size_bytes.is_multiple_of(pointer_size) {
+            return Err(ParseError::Unexpected {
+                what: "stack size",
+                got: format!("{size_bytes} bytes is not a multiple of the {pointer_size}-byte pointer"),
+            });
+        }
+
+        let bytes = r.bytes(size_bytes, "stack frames")?;
+        let frames: Vec<u64> = bytes
+            .chunks_exact(pointer_size)
+            .map(|chunk| {
+                let mut buf = [0u8; 8];
+                buf[..pointer_size].copy_from_slice(chunk);
+                u64::from_le_bytes(buf)
+            })
+            .collect();
+
+        out.current.insert(first_id.wrapping_add(index), frames);
+    }
+    Ok(())
 }
 
 /// Parse the rows of an Event or Metadata block. Header state is per-block, so it starts zeroed.
@@ -446,6 +553,90 @@ mod tests {
         let second = parser.next_events().unwrap().unwrap();
         assert_eq!(first[0].timestamp, 1_000);
         assert_eq!(second[0].timestamp, 7, "not 1007");
+    }
+
+    /// A StackBlock body: FirstId, Count, then per stack a byte length and that many bytes.
+    fn stack_block(first_id: u32, stacks: &[&[u64]]) -> Vec<u8> {
+        let mut out = first_id.to_le_bytes().to_vec();
+        out.extend_from_slice(&(stacks.len() as u32).to_le_bytes());
+        for frames in stacks {
+            out.extend_from_slice(&((frames.len() * 8) as u32).to_le_bytes());
+            for frame in *frames {
+                out.extend_from_slice(&frame.to_le_bytes());
+            }
+        }
+        out
+    }
+
+    #[test]
+    fn stack_blocks_assign_consecutive_ids_from_first_id() {
+        let mut table = StackTable::default();
+        let block = stack_block(10, &[&[0xAA, 0xBB], &[0xCC]]);
+        parse_stack_block(&block, 8, &mut table).unwrap();
+
+        assert_eq!(table.get(10).unwrap(), &[0xAA, 0xBB]);
+        assert_eq!(table.get(11).unwrap(), &[0xCC]);
+        assert!(table.get(12).is_none());
+    }
+
+    #[test]
+    fn a_stack_size_that_is_not_a_whole_number_of_pointers_is_rejected() {
+        let mut table = StackTable::default();
+        // 12 bytes cannot be 64-bit frames.
+        let mut block = 0u32.to_le_bytes().to_vec();
+        block.extend_from_slice(&1u32.to_le_bytes());
+        block.extend_from_slice(&12u32.to_le_bytes());
+        block.extend_from_slice(&[0u8; 12]);
+
+        assert!(parse_stack_block(&block, 8, &mut table).is_err());
+    }
+
+    #[test]
+    fn rotating_keeps_the_previous_generation_reachable() {
+        // Samples referencing a stack defined just before a sequence point must still resolve.
+        let mut table = StackTable::default();
+        parse_stack_block(&stack_block(1, &[&[0x1111]]), 8, &mut table).unwrap();
+
+        table.rotate();
+        assert_eq!(table.get(1).unwrap(), &[0x1111], "still reachable one generation back");
+
+        parse_stack_block(&stack_block(2, &[&[0x2222]]), 8, &mut table).unwrap();
+        assert_eq!(table.get(1).unwrap(), &[0x1111]);
+        assert_eq!(table.get(2).unwrap(), &[0x2222]);
+    }
+
+    #[test]
+    fn a_recycled_id_resolves_to_the_newer_stack() {
+        // Ids are reused after a sequence point; the current generation must win.
+        let mut table = StackTable::default();
+        parse_stack_block(&stack_block(1, &[&[0xDEAD]]), 8, &mut table).unwrap();
+        table.rotate();
+        parse_stack_block(&stack_block(1, &[&[0xBEEF]]), 8, &mut table).unwrap();
+
+        assert_eq!(table.get(1).unwrap(), &[0xBEEF]);
+    }
+
+    #[test]
+    fn two_rotations_drop_the_oldest_generation() {
+        let mut table = StackTable::default();
+        parse_stack_block(&stack_block(1, &[&[0x1111]]), 8, &mut table).unwrap();
+        table.rotate();
+        table.rotate();
+        assert!(table.get(1).is_none(), "bounded memory, not unbounded history");
+        assert!(table.is_empty());
+    }
+
+    #[test]
+    fn thirty_two_bit_frames_are_read_at_pointer_width() {
+        let mut table = StackTable::default();
+        let mut block = 0u32.to_le_bytes().to_vec();
+        block.extend_from_slice(&1u32.to_le_bytes());
+        block.extend_from_slice(&8u32.to_le_bytes());
+        block.extend_from_slice(&0x1111_2222u32.to_le_bytes());
+        block.extend_from_slice(&0x3333_4444u32.to_le_bytes());
+
+        parse_stack_block(&block, 4, &mut table).unwrap();
+        assert_eq!(table.get(0).unwrap(), &[0x1111_2222, 0x3333_4444]);
     }
 
     #[test]

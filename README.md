@@ -36,6 +36,7 @@ countercow ps              # list attachable processes and exit
 | `q` / `Esc` | quit |
 | `d` | detach and pick another process |
 | `i` | investigate: allocations, GC causes, exceptions, contention |
+| `c` | CPU profile: which methods are burning time |
 | `p` | pause history (the session keeps running) |
 | `m` | switch braille / octant plotting |
 | `?` | help |
@@ -71,6 +72,37 @@ Allocation counts are *sampled* — the runtime emits a tick roughly every 100 K
 allocation, and per large-object allocation — so treat the byte totals as a good estimate of where
 pressure comes from rather than an exact ledger.
 
+## CPU profiling
+
+`c` runs a fixed five-second profile and ranks methods by self time:
+
+```
+   SELF    TOTAL  METHOD
+  21.4%    37.1%  Workload.Checksum
+  15.7%    15.7%  Workload.Mix
+  14.9%    14.9%  (native / runtime code)
+```
+
+**Self** is time with the method as the innermost frame — time spent *in* it. **Total** includes
+its callees, so `Checksum` at 37.1% is its own 21.4% plus the 15.7% it spends inside `Mix`.
+Ranking is by self, because a list sorted by total is topped by whatever sits at the bottom of
+every stack.
+
+Unlike the other screens this one is not live, and cannot be. Stack frames arrive as bare
+instruction pointers; the table mapping them to method names is only emitted when the session
+*stops*. So a profile is necessarily "collect for a window, then resolve".
+
+Two things worth knowing about the numbers:
+
+- **Parked threads are excluded by default.** The sampler measures thread time, not CPU time — it
+  samples every thread on every tick, including ones asleep in a wait. Unfiltered, the list is
+  topped by whichever thread idles longest. The header reports what share was parked, and `w`
+  shows them anyway. The runtime *does* tag each sample with a type that should make this
+  distinction, but on macOS/arm64 every sample reports `External`, measured across 27,000 samples
+  of a busy process — so parked threads are identified from their stacks instead.
+- **`(native / runtime code)` is normal and often large.** The GC, the JIT and syscalls are not
+  jitted methods and have no names to resolve to. Naming them anything else would be a guess.
+
 ## What it shows
 
 The dashboard adapts to the process. **ASP.NET Core** apps get request and Kestrel connection
@@ -102,6 +134,7 @@ Three layers, bottom-up:
 | `src/nettrace/` | The nettrace V4 stream format with V5 metadata tags — FastSerializer framing, block dispatch, compressed event headers, metadata and payload decoding. |
 | `src/counters/` | Turning `EventCounters` events into samples, and knowing how to present them. |
 | `src/runtime/` | The investigation session: GC, allocation, exception and contention events. |
+| `src/profile/` | CPU profiling: samples, stacks, the method rundown, and hot-method ranking. |
 
 Counter display names and units are read off the wire rather than from a table, because the
 runtime sends them in every payload — and because the table that used to hold them
@@ -129,6 +162,10 @@ reading the code:
 - **`Microsoft-Windows-DotNETRuntime` is manifest-based**, so unlike EventSource providers it
   sends no event names and no field lists — only a numeric id. Its payloads can only be decoded
   from schemas hardcoded per `(id, version)`.
+- **Stack ids are recycled** after a sequence point, but stack blocks also lag the events that
+  reference them. Resolving eagerly loses most samples; resolving at the end reads the wrong
+  stacks and silently yields addresses in no method at all. Two generations of stack table,
+  rotated at each sequence point, is what gets both right.
 
 v1 reads EventCounters, which work unchanged from .NET 6 through .NET 10. The newer
 `System.Diagnostics.Metrics` meters arrived piecemeal (ASP.NET Core in .NET 8, `System.Runtime`
@@ -149,9 +186,16 @@ Unit tests cover the byte-level rules that fail silently. Beyond those:
   20x5.
 
 ```bash
-cargo run --example preview -- [aspnet|generic|loaded|console] [width] [height]
-cargo run --example capture -- <pid> <path> [seconds]     # regenerate a fixture
+cargo run --example preview -- [aspnet|generic|loaded|console|investigate] [w] [h]
+cargo run --example capture -- <pid> <path> [seconds] [counters|runtime|profile]
+cargo run --example profile_cli -- <pid> [seconds] [--all] [--stacks]
+cargo run --example probe -- <pid> <provider> <keywords-hex> [seconds] [ids]
 ```
+
+`probe` is the investigation tool: it subscribes to any provider and reports what actually
+arrives, including raw payload bytes. Every hardcoded event layout in `src/runtime/` and
+`src/profile/` was derived and verified with it, and it is the way to re-verify on a runtime
+version this has not seen.
 
 `testapps/` holds a small ASP.NET Core API and a console app that move counters in recognisable
 ways — endpoints for allocating, retaining, throwing and queueing work. They multi-target so the

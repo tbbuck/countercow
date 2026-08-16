@@ -6,6 +6,7 @@
 // connection counts.
 
 using System.Diagnostics;
+using System.Runtime.CompilerServices;
 
 var builder = WebApplication.CreateBuilder(args);
 var app = builder.Build();
@@ -82,4 +83,35 @@ app.MapGet("/work", (int items = 200) =>
 // An unhandled 500, so failed-requests moves.
 app.MapGet("/fail", () => Results.Problem("deliberate failure"));
 
+// Pure managed CPU work, for the profiler to attribute. Deliberately does no allocation and
+// makes no calls out to the runtime, so the samples land squarely in these two methods.
+app.MapGet("/compute", (int iterations = 4_000_000) => Results.Ok(new
+{
+    checksum = Workload.Checksum(iterations),
+}));
+
 app.Run();
+
+/// Named, non-inlined methods so they are recognisable in a profile.
+internal static class Workload
+{
+    [MethodImpl(MethodImplOptions.NoInlining)]
+    internal static long Checksum(int iterations)
+    {
+        long accumulator = 0;
+        for (var i = 1; i <= iterations; i++)
+        {
+            accumulator += Mix(i);
+        }
+        return accumulator;
+    }
+
+    [MethodImpl(MethodImplOptions.NoInlining)]
+    private static long Mix(int value)
+    {
+        long mixed = value * 2654435761L;
+        mixed ^= mixed >> 13;
+        mixed *= unchecked((long)0x9E3779B97F4A7C15);
+        return mixed ^ (mixed >> 7);
+    }
+}
