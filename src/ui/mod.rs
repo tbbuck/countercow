@@ -37,8 +37,26 @@ const CHANNEL_CAPACITY: usize = 1024;
 
 pub type Result<T> = color_eyre::Result<T>;
 
+/// Fail with an explanation rather than a panic when there is no terminal to draw on.
+///
+/// Piping or redirecting countercow is an easy mistake to make, and ratatui's own failure here is
+/// a crash report about an unconfigured device.
+fn ensure_terminal() -> Result<()> {
+    use std::io::IsTerminal;
+
+    if std::io::stdout().is_terminal() {
+        return Ok(());
+    }
+    color_eyre::eyre::bail!(
+        "countercow draws an interactive dashboard and needs a terminal, but stdout is not one.\n\
+         For non-interactive use try `countercow ps` to list processes, or \
+         `countercow --pid <pid> dump` to print samples."
+    )
+}
+
 /// Show the picker and return the chosen process, or `None` if the user quit.
 pub fn pick_process() -> Result<Option<DotnetProcess>> {
+    ensure_terminal()?;
     let found = discovery::discover()?;
 
     // Ask each runtime who it is. Discovery reports "dotnet" for framework-dependent apps, which
@@ -103,6 +121,8 @@ fn run_picker(terminal: &mut DefaultTerminal, picker: &mut Picker, theme: &Theme
 
 /// Attach to a process and run the dashboard until the user quits or the process exits.
 pub fn run_dashboard(process: DotnetProcess, info: ProcessInfo, interval: f64) -> Result<()> {
+    ensure_terminal()?;
+
     let socket = process.socket.clone();
     let session = session::start(&socket, interval)?;
     let session_id = session.session_id;
