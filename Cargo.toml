@@ -2,6 +2,10 @@
 name = "countercow"
 version = "0.1.0"
 edition = "2021"
+# Held down deliberately. The only thing that wanted more was sysinfo 0.39, which jumped to
+# 1.95 for no feature this uses; 0.38 does the same job at 1.88. Everything else in the tree,
+# ratatui included, is happy at 1.88.
+rust-version = "1.88"
 description = "A btop for .NET: live runtime counters, GC and allocation forensics, and a CPU profiler, in one terminal binary"
 license = "MIT"
 repository = "https://github.com/tbbuck/countercow"
@@ -15,7 +19,9 @@ color-eyre = "0.6"
 crossbeam-channel = "0.5"
 crossterm = "0.29"
 ratatui = "0.30.2"
-sysinfo = "=0.39.6"
+# Pinned exactly: sysinfo changes its API across minor versions, so a float here breaks builds
+# rather than just moving them.
+sysinfo = "=0.38.4"
 
 [profile.release]
 lto = true

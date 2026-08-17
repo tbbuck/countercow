@@ -131,7 +131,18 @@ out about.
 cargo build --release
 ```
 
-Requires Rust 1.88+ (ratatui's MSRV). No other dependencies.
+**Requires Rust 1.88+**, verified by building and running the full suite on 1.88 and 1.92, not
+just declared. No other dependencies.
+
+The floor is ratatui's. `sysinfo` is pinned to 0.38 rather than 0.39 for the same reason — 0.39
+raised its own floor to 1.95 without needing anything this uses — and pinned *exactly* because
+sysinfo changes its API across minor versions, so a float there breaks builds rather than merely
+moving them.
+
+```bash
+scripts/msrv-report.sh            # what the dependency tree actually demands
+scripts/crate-msrv-history.sh sysinfo   # how far back a crate stays compatible
+```
 
 ## How it works
 
