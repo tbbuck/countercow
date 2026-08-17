@@ -16,7 +16,7 @@ use std::fmt;
 use std::fs;
 use std::path::{Path, PathBuf};
 
-use sysinfo::{Pid, ProcessRefreshKind, ProcessesToUpdate, System};
+use sysinfo::{Pid, ProcessRefreshKind, ProcessesToUpdate, System, Uid};
 
 const SOCKET_PREFIX: &str = "dotnet-diagnostic-";
 const SOCKET_SUFFIX: &str = "-socket";
@@ -120,6 +120,21 @@ fn process_start_key(pid: u32, system: &System) -> Option<u64> {
     system.process(Pid::from_u32(pid)).map(sysinfo::Process::start_time)
 }
 
+/// Whether another user's socket should be treated as unreachable.
+///
+/// Diagnostic sockets are mode 0600, so ordinarily they are. Root is not bound by that, and
+/// filtering while privileged would make `sudo countercow` list *fewer* processes than running
+/// unprivileged — exactly backwards from what reaching for sudo is meant to achieve.
+///
+/// When our own uid is unknown the filter stays on: we cannot demonstrate we are privileged, and
+/// listing a process we then fail to attach to is the worse outcome.
+fn should_filter_by_owner(own_uid: Option<&Uid>) -> bool {
+    match own_uid {
+        Some(uid) => Uid::try_from(0usize).is_ok_and(|root| *uid != root),
+        None => true,
+    }
+}
+
 fn display_name(process: &sysinfo::Process) -> String {
     process
         .exe()
@@ -174,6 +189,7 @@ pub fn discover() -> Result<Discovery, DiscoveryError> {
         .and_then(|pid| system.process(pid))
         .and_then(|p| p.user_id())
         .cloned();
+    let filter_by_owner = should_filter_by_owner(own_uid.as_ref());
 
     let mut found = Discovery::default();
     // A process can have several sockets on disk; keep only the best candidate per PID.
@@ -191,11 +207,14 @@ pub fn discover() -> Result<Discovery, DiscoveryError> {
             continue;
         };
 
-        // Sockets are mode 0600, so another user's endpoint is visible but unusable.
-        if let (Some(own), Some(theirs)) = (own_uid.as_ref(), process.user_id()) {
-            if own != theirs {
-                found.foreign += 1;
-                continue;
+        // Sockets are mode 0600, so another user's endpoint is normally visible but unusable.
+        // Root is the exception and must not be filtered — see `should_filter_by_owner`.
+        if filter_by_owner {
+            if let (Some(own), Some(theirs)) = (own_uid.as_ref(), process.user_id()) {
+                if own != theirs {
+                    found.foreign += 1;
+                    continue;
+                }
             }
         }
 
@@ -276,6 +295,25 @@ mod tests {
         ] {
             assert_eq!(parse_socket_name(&OsString::from(name)), None, "{name}");
         }
+    }
+
+    #[test]
+    fn root_is_not_subject_to_the_ownership_filter() {
+        // Otherwise `sudo countercow` would list fewer processes than running as yourself.
+        let root = Uid::try_from(0usize).expect("uid 0 is constructible on unix");
+        assert!(!should_filter_by_owner(Some(&root)));
+    }
+
+    #[test]
+    fn an_ordinary_user_is_subject_to_it() {
+        let user = Uid::try_from(501usize).expect("a normal uid is constructible");
+        assert!(should_filter_by_owner(Some(&user)));
+    }
+
+    #[test]
+    fn an_unknown_uid_keeps_the_filter() {
+        // Listing a process we cannot actually attach to is worse than omitting it.
+        assert!(should_filter_by_owner(None));
     }
 
     #[test]

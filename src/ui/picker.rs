@@ -7,7 +7,7 @@ use ratatui::widgets::{Block, Paragraph, Row, Table, TableState};
 use ratatui::Frame;
 
 use crate::ipc::commands::ProcessInfo;
-use crate::ipc::discovery::{Discovery, DotnetProcess};
+use crate::ipc::discovery::{self, Discovery, DotnetProcess};
 
 use super::theme::Theme;
 
@@ -163,7 +163,13 @@ impl Picker {
             Line::from(Span::from("No attachable .NET processes found.").fg(theme.warn)),
             Line::from(""),
             Line::from(Span::from("A process is attachable when it is running a .NET").fg(theme.dim)),
-            Line::from(Span::from("runtime with diagnostics enabled, and belongs to you.").fg(theme.dim)),
+            Line::from(Span::from("runtime with diagnostics enabled.").fg(theme.dim)),
+            Line::from(""),
+            // Naming the directory is the fastest way to spot the usual cause: the runtime puts
+            // its socket in the target's $TMPDIR, and running under sudo or a different shell
+            // can point this somewhere the processes you care about never wrote to.
+            Line::from(Span::from("Searched:").fg(theme.dim)),
+            Line::from(Span::from(format!("  {}", discovery::ipc_root().display())).fg(theme.dim)),
         ];
         if self.skipped.foreign > 0 {
             lines.push(Line::from(""));

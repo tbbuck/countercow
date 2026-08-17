@@ -164,7 +164,9 @@ A few things in this protocol fail *silently* rather than loudly, and are worth 
 reading the code:
 
 - **The socket directory is `$TMPDIR`, not `/tmp`.** On macOS that's a per-user sandbox path, so
-  globbing `/tmp` finds nothing at all even with a dozen .NET processes running.
+  globbing `/tmp` finds nothing at all even with a dozen .NET processes running. It also means
+  `sudo countercow` searches *root's* `$TMPDIR` on macOS and finds less than running unprivileged,
+  not more — which is why the empty-list screen names the directory it searched.
 - **Most sockets on disk are stale.** A typical developer machine has far more dead socket files
   than live processes. The filename embeds the process start time, which countercow checks against
   the live process to avoid attaching to a recycled PID — a guard the reference client doesn't have.
