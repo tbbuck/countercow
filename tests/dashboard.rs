@@ -232,9 +232,18 @@ fn generation_captions(output: &str) -> String {
 }
 
 #[test]
-fn the_footer_shows_the_refresh_rate_and_how_to_change_it() {
-    let output = render(&app_from(ASPNET), 120, 40);
-    assert!(output.contains("-/+ 1s"), "the rate and its keys belong in the footer");
+fn the_header_shows_the_refresh_rate_at_every_width() {
+    // The x axis is meaningless without it, so unlike the keymap it must never be dropped.
+    for width in [200, 120, 80, 64] {
+        let header = rows(&render(&app_from(ASPNET), width, 20))[0].to_owned();
+        assert!(header.contains("-/+ 1s"), "{width} columns lost the rate: {header:?}");
+    }
+}
+
+#[test]
+fn the_rate_is_shown_once_rather_than_in_both_the_header_and_the_footer() {
+    let output = render(&app_from(ASPNET), 200, 60);
+    assert_eq!(output.matches("-/+").count(), 1, "the footer should not repeat the header");
 }
 
 #[test]

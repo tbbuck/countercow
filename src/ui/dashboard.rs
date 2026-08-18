@@ -52,7 +52,18 @@ pub fn render(frame: &mut Frame, app: &App, theme: &Theme) {
 }
 
 fn render_header(frame: &mut Frame, area: Rect, app: &App, theme: &Theme) {
-    let block = chart::bordered(theme);
+    // The rate lives in the top border rather than among the header's own detail, which is built
+    // up only while it fits and so would drop it first on a narrow terminal. It is the one piece
+    // of state you need to read the graphs at all — the x axis means nothing without it — so it
+    // stays put at every size. The keys come with it, which is why the footer does not repeat it.
+    let block = chart::bordered(theme).title_top(
+        Line::from(vec![
+            Span::from(" -/+ ").fg(theme.dim),
+            Span::from(format_interval(app.interval)).fg(theme.accent).bold(),
+            Span::from(" "),
+        ])
+        .right_aligned(),
+    );
     let inner = block.inner(area);
     frame.render_widget(block, area);
 
@@ -114,13 +125,13 @@ fn render_footer(frame: &mut Frame, area: Rect, app: &App, theme: &Theme) {
     // Least useful last: a narrow terminal drops whole hints from the right rather than clipping
     // one in half. Help comes second despite reading oddly there, because it is the hint that
     // gets you to all the others — losing it first would hide the rest of the keys entirely.
+    // The refresh rate is absent on purpose: the header carries it at every width.
     let hints = [
         ("q", "quit".to_owned()),
         ("?", "help".to_owned()),
         ("i", "investigate".to_owned()),
         ("c", "cpu".to_owned()),
         ("d", "detach".to_owned()),
-        ("-/+", format_interval(app.interval)),
         ("p", "pause".to_owned()),
         ("m", theme.plot_name().to_owned()),
     ];

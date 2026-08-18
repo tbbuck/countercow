@@ -20,8 +20,13 @@ struct Cli {
     #[arg(long, global = true)]
     name: Option<String>,
 
-    /// Counter refresh interval in seconds.
-    #[arg(long, global = true, default_value_t = counters::session::DEFAULT_INTERVAL_SECS)]
+    /// Counter refresh interval in seconds. Adjustable in the dashboard with - and +.
+    #[arg(
+        long,
+        global = true,
+        default_value_t = counters::session::DEFAULT_INTERVAL_SECS,
+        value_parser = parse_interval
+    )]
     interval: f64,
 
     #[command(subcommand)]
@@ -38,6 +43,25 @@ enum Command {
         #[arg(long, default_value_t = 5)]
         seconds: u64,
     },
+}
+
+/// Smallest and largest refresh intervals worth asking the runtime for.
+///
+/// Zero is the one that matters: it is what a typo produces, and the runtime takes it literally —
+/// the session opens, reports nothing, and the dashboard sits there looking attached to a dead
+/// process. The upper bound is judgement rather than a limit.
+const MIN_INTERVAL_SECS: f64 = 0.05;
+const MAX_INTERVAL_SECS: f64 = 60.0;
+
+fn parse_interval(text: &str) -> std::result::Result<f64, String> {
+    let seconds: f64 = text.parse().map_err(|_| format!("{text:?} is not a number"))?;
+    if !(MIN_INTERVAL_SECS..=MAX_INTERVAL_SECS).contains(&seconds) {
+        return Err(format!(
+            "{seconds} seconds is outside the {MIN_INTERVAL_SECS}–{MAX_INTERVAL_SECS} range \
+             countercow can sample at"
+        ));
+    }
+    Ok(seconds)
 }
 
 fn main() -> Result<()> {

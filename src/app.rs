@@ -198,17 +198,18 @@ impl App {
     /// it is really running at.
     pub fn step_interval(&mut self, faster: bool) {
         let from = self.pending_interval.unwrap_or(self.interval);
-        let current = nearest_interval(from);
+
+        // The nearest rung in the direction asked for, rather than the nearest rung and then a
+        // step: `--interval` need not be on the ladder, and from 0.1s the nearest rung is 0.25s,
+        // so stepping from it would answer a request to speed up by slowing down.
         let next = if faster {
-            current.saturating_sub(1)
+            INTERVALS.iter().rev().find(|&&rung| rung < from)
         } else {
-            (current + 1).min(INTERVALS.len() - 1)
+            INTERVALS.iter().find(|&&rung| rung > from)
         };
 
-        // An interval given on the command line need not be on the ladder, so snapping it to the
-        // nearest rung counts as a change; landing back on the rate we already have does not.
-        if INTERVALS[next] != from {
-            self.pending_interval = Some(INTERVALS[next]);
+        if let Some(&rung) = next {
+            self.pending_interval = Some(rung);
         }
     }
 
@@ -409,16 +410,6 @@ impl App {
     }
 }
 
-/// The rung of [`INTERVALS`] closest to `interval`.
-fn nearest_interval(interval: f64) -> usize {
-    INTERVALS
-        .iter()
-        .enumerate()
-        .min_by(|(_, a), (_, b)| (*a - interval).abs().total_cmp(&(*b - interval).abs()))
-        .map(|(index, _)| index)
-        .unwrap_or(0)
-}
-
 /// Format a duration as the header shows it.
 pub fn format_uptime(duration: Duration) -> String {
     let total = duration.as_secs();
@@ -583,8 +574,8 @@ mod tests {
         assert_eq!(app.take_pending_interval(), Some(0.5), "still one rung below 1s");
     }
 
-    #[test]
-    fn an_off_ladder_interval_snaps_to_the_nearest_rung() {
+    /// An app started at an interval that is not on the ladder, as `--interval` allows.
+    fn app_at(interval: f64) -> App {
         let process = DotnetProcess {
             pid: 1,
             socket: PathBuf::from("/tmp/socket"),
@@ -592,10 +583,41 @@ mod tests {
             command: "test".into(),
             start_key_verified: true,
         };
-        // --interval 0.7 sits between rungs; stepping slower should reach 1.0, not 1.4.
-        let mut app = App::new(process, ProcessInfo::default(), 0.7);
+        App::new(process, ProcessInfo::default(), interval)
+    }
+
+    #[test]
+    fn an_off_ladder_interval_steps_to_the_next_rung_along() {
+        // 0.7 sits between rungs, so a step should reach the neighbouring one, not 0.7 ± a rung.
+        let mut slower = app_at(0.7);
+        slower.step_interval(false);
+        assert_eq!(slower.take_pending_interval(), Some(1.0));
+
+        let mut faster = app_at(0.7);
+        faster.step_interval(true);
+        assert_eq!(faster.take_pending_interval(), Some(0.5));
+    }
+
+    #[test]
+    fn stepping_always_moves_in_the_direction_asked_for() {
+        // From below the fastest rung, the nearest rung is a *slower* one. Speeding up from there
+        // must do nothing rather than obey the nearest rung and slow the dashboard down.
+        let mut app = app_at(0.1);
+        app.step_interval(true);
+        assert_eq!(app.take_pending_interval(), None, "already faster than the ladder");
+
         app.step_interval(false);
-        assert_eq!(app.take_pending_interval(), Some(1.0));
+        assert_eq!(app.take_pending_interval(), Some(0.25));
+    }
+
+    #[test]
+    fn an_interval_beyond_the_slowest_rung_can_still_be_sped_up() {
+        let mut app = app_at(120.0);
+        app.step_interval(false);
+        assert_eq!(app.take_pending_interval(), None, "already slower than the ladder");
+
+        app.step_interval(true);
+        assert_eq!(app.take_pending_interval(), Some(10.0));
     }
 
     #[test]

@@ -49,6 +49,7 @@ is what the runtime reported, and the newest reading is always at the right edge
 countercow                 # pick a process from a list
 countercow --pid 1234      # attach directly
 countercow --name MyApi    # attach by name
+countercow --interval 0.5  # start at a different refresh rate (default: 1s)
 countercow ps              # list attachable processes and exit
 ```
 
@@ -66,11 +67,19 @@ countercow ps              # list attachable processes and exit
 Detaching closes the EventPipe session properly and re-discovers processes, so it picks up
 anything that has started since — handy when the thing you want to watch is still building.
 
-`-` and `+` step the refresh rate between 0.25s and 10s (`--interval` sets the starting point).
+Counters start flowing the moment you attach — the session opens before the first frame, and
+nothing needs starting by hand. (Investigating and profiling are the exceptions, and deliberately
+so: both cost the target real CPU, so they run only while you are looking at them.)
+
+Counters refresh **once a second** by default. `-` and `+` step that between 0.25s and 10s, and
+the rate in force is always shown in the top right corner — the graphs place samples by index, so
+their time axis means nothing without it. `--interval` sets where it starts.
+
 The runtime is told the rate when the counter session opens and there is no way to change it in
 place, so each step closes that session and opens another. History gathered at the old rate is
-dropped rather than spliced onto the new — the graphs place samples by index, so keeping it would
-silently stretch part of the trace.
+dropped rather than spliced onto the new: two cadences in one series would silently stretch part
+of the trace. The latest reading of each counter survives, so the number panels stay populated
+while the graphs refill.
 
 ## Investigating
 
