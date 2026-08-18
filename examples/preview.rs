@@ -4,7 +4,7 @@
 //! reviewable in a diff.
 //!
 //! ```text
-//! cargo run --example preview -- [aspnet|generic|loaded|console|investigate] \
+//! cargo run --example preview -- [aspnet|generic|loaded|console|investigate|profile] \
 //!     [width] [height] [--colour|--html] [--repeat N] [--plot braille|block|octant]
 //! ```
 //!
@@ -19,9 +19,10 @@ use countercow::counters::sample;
 use countercow::ipc::commands::ProcessInfo;
 use countercow::ipc::discovery::DotnetProcess;
 use countercow::nettrace::blocks::NettraceParser;
+use countercow::profile::run as profile_run;
 use countercow::runtime::session as runtime_session;
 use countercow::ui::theme::Theme;
-use countercow::ui::{dashboard, investigate};
+use countercow::ui::{dashboard, investigate, profile};
 
 use ratatui::backend::TestBackend;
 use ratatui::style::Color;
@@ -32,6 +33,7 @@ const GENERIC: &[u8] = include_bytes!("../tests/fixtures/generic-net10.nettrace"
 const LOADED: &[u8] = include_bytes!("../tests/fixtures/aspnet-net10-loaded.nettrace");
 const CONSOLE: &[u8] = include_bytes!("../tests/fixtures/console-net8.nettrace");
 const RUNTIME: &[u8] = include_bytes!("../tests/fixtures/runtime-net10-loaded.nettrace");
+const PROFILE: &[u8] = include_bytes!("../tests/fixtures/profile-net10-cpu.nettrace");
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let args: Vec<String> = std::env::args().skip(1).collect();
@@ -59,10 +61,13 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let width: u16 = positional.get(1).map_or(Ok(120), |a| a.parse())?;
     let height: u16 = positional.get(2).map_or(Ok(40), |a| a.parse())?;
 
+    // The runtime and profile captures came from the same sample app as the loaded one, so they
+    // are named for it: a screenshot captioned with the wrong process is a small lie.
     let (fixture, name, version) = match which.as_str() {
         "generic" => (GENERIC, "Rider.Backend", "10.0.1"),
         "loaded" => (LOADED, "CounterCowSampleApi", "10.0.1"),
         "console" => (CONSOLE, "CounterCowSampleConsole", "8.0.19"),
+        "investigate" | "profile" => (LOADED, "CounterCowSampleApi", "10.0.1"),
         _ => (ASPNET, "CrimeRate.VectorTileApi", "9.0.7"),
     };
 
@@ -82,8 +87,13 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let mut app = App::new(process, info, 1.0);
     let investigating = which == "investigate";
+    let profiling = which == "profile";
 
-    if investigating {
+    if profiling {
+        // Replay a captured profile through the same ranking the live one uses.
+        app.start_profile();
+        app.finish_profile(profile_run::collect(std::io::Cursor::new(PROFILE), |_| {})?);
+    } else if investigating {
         // Replay a captured runtime session through the same path the live one uses.
         app.toggle_investigate();
         runtime_session::run(std::io::Cursor::new(RUNTIME), |event, qpc| {
@@ -119,7 +129,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
     let theme = theme;
     terminal.draw(|frame| {
-        if investigating {
+        if profiling {
+            profile::render(frame, &app, &theme);
+        } else if investigating {
             investigate::render(frame, &app, &theme);
         } else {
             dashboard::render(frame, &app, &theme);

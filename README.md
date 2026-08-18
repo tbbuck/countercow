@@ -19,29 +19,16 @@ It is a single self-contained Rust binary that speaks the .NET Diagnostics IPC a
 protocols directly over a Unix socket — **no .NET SDK, no `dotnet-counters`, no managed dependency
 at runtime**. Works against .NET 6 through 10, on Linux and macOS.
 
-```
-╭ Heap size ──────────────────────────────────────── 25.3 MiB ╮╭ Memory ────────────────────╮
-│27.6 MiB                                   ⣀⣀⣀⣤⣤⣀⣀⣀⣀⣀⣀⣀⣀⣤⣤⣤⣤⣤││Working set        118.5 MiB│
-│                  ⢀⣀⣠⣤⣤⣤⣤⣤⣤⣤⣤⣶⣶⣶⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿││Heap size           25.7 MiB│
-│       ⣀⣠⣤⣴⣶⣶⣶⣶⣾⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿││Committed           15.2 MiB│
-│⣀⣠⣤⣴⣶⣾⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿││Alloc rate        81.6 MiB/s│
-│⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿││Fragmented            57.2 %│
-│⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿││                            │
-╰ -121s ──────────────────────────────────────────────────────╯╰────────────────────────────╯
-╭ Heap by generation ─────────────────────────────────────────╮╭ GC activity ───────────────╮
-│ ░░░░░░░░░░  ░░░░░░░░░░  ░░░░░░░░░░  ██████████  ░░░░░░░░░░░ ││Gen 0 GCs              3/min│
-│ ░░░░░░░░░░  ░░░░░░░░░░  ░░░░░░░░░░  ██████████  ░░░░░░░░░░░ ││Gen 1 GCs              3/min│
-│ ░░░░░░░░░░  ░░░░░░░░░░  ░░░░░░░░░░  ██████████  ░░░░░░░░░░░ ││Gen 2 GCs              3/min│
-│ ░░░░░░░░░░  ░░░░░░░░░░  ▁▁▁▁▁▁▁▁▁▁  ██████████  ░░░░░░░░░░░ ││Time in GC             0.0 %│
-│ ▁▁▁▁▁▁▁▁▁▁  ▁▁▁▁▁▁▁▁▁▁  ██████████  ██████████  ▂▂▂▂▂▂▂▂▂▂▂ ││Pause time            4.2 ms│
-│ 131.7 KiB    17.7 KiB   941.1 KiB    4.09 MiB    166.1 KiB  ││Gen 0 budget       119.2 MiB│
-│   Gen 0       Gen 1       Gen 2        LOH          POH     ││                            │
-╰─────────────────────────────────────────────────────────────╯╰────────────────────────────╯
-```
+![The countercow dashboard: heap and request graphs, generation bars, and runtime panels](docs/dashboard.png)
 
 Every graph is filled from the baseline and coloured by height, so a spike changes colour as it
 climbs rather than only getting taller. One sample per sub-column, no interpolation: what you see
-is what the runtime reported, and the newest reading is always at the right edge.
+is what the runtime reported, and the newest reading is always at the right edge. CPU is the one
+counter with a real ceiling, so it holds a fixed 0–100% scale — a process ticking over at 7% looks
+like a process ticking over at 7%, not like one on fire.
+
+The layout adapts to the process: this is an ASP.NET Core app, so it gets request and Kestrel
+panels. See [What it shows](#what-it-shows).
 
 ## Usage
 
@@ -85,16 +72,7 @@ while the graphs refill.
 
 Counters tell you *that* the heap is growing. `i` tells you *what* is growing it:
 
-```
-╭ Allocations by type ───────────────────────────────────╮╭ Collections ─────────────╮
-│System.Byte[]                     LOH   228.0 MiB  97.9%││#251  gen2 large    4.0 ms│
-│System.String                     SOH   520.5 KiB   0.2%││#250  gen2 large    4.3 ms│
-│System.IO.Pipelines.Pipe          SOH   312.5 KiB   0.1%││#249  gen2 large    4.2 ms│
-╰────────────────────────────────────────────────────────╯╰──────────────────────────╯
-╭ Exceptions thrown ─────────────────────────────────────╮╭ Lock contention ─────────╮
-│System.InvalidOperationExcep sample failure        1,425││Waits                    1│
-╰────────────────────────────────────────────────────────╯╰──────────────────────────╯
-```
+![The investigation screen: allocations by type, recent collections, exceptions and lock contention](docs/investigate.png)
 
 That reads as one causal story: byte arrays are going to the large object heap, which is forcing
 gen 2 collections, at ~4 ms of pause each.
@@ -113,15 +91,10 @@ pressure comes from rather than an exact ledger.
 
 `c` runs a fixed five-second profile and ranks methods by self time:
 
-```
-   SELF    TOTAL  METHOD
-  21.4%    37.1%  Workload.Checksum
-  15.7%    15.7%  Workload.Mix
-  14.9%    14.9%  (native / runtime code)
-```
+![The CPU profile screen: methods ranked by self time](docs/profile.png)
 
 **Self** is time with the method as the innermost frame — time spent *in* it. **Total** includes
-its callees, so `Checksum` at 37.1% is its own 21.4% plus the 15.7% it spends inside `Mix`.
+its callees, so `Checksum` at 20.5% is its own 7.6% plus the 12.9% it spends inside `Mix`.
 Ranking is by self, because a list sorted by total is topped by whatever sits at the bottom of
 every stack.
 
@@ -236,11 +209,24 @@ Unit tests cover the byte-level rules that fail silently. Beyond those:
   20x5.
 
 ```bash
-cargo run --example preview -- [aspnet|generic|loaded|console|investigate] [w] [h]
+cargo run --example preview -- [aspnet|generic|loaded|console|investigate|profile] [w] [h]
 cargo run --example capture -- <pid> <path> [seconds] [counters|runtime|profile]
 cargo run --example profile_cli -- <pid> [seconds] [--all] [--stacks]
 cargo run --example probe -- <pid> <provider> <keywords-hex> [seconds] [ids]
+cargo run --example rate_probe -- <pid> [seconds]
 ```
+
+`preview` draws any screen from fixture data with no process attached, which is how UI changes are
+reviewed: plain text by default so a diff shows them, `--colour` or `--html` when the change is to
+the colours. The screenshots in this README are that HTML screenshotted, so they can be
+regenerated rather than going stale:
+
+```bash
+scripts/preview-png.sh loaded 120 40 60 docs/dashboard.png
+```
+
+`rate_probe` checks the one thing no test can reach without a live runtime: that `-` and `+` really
+do close one EventPipe session and open another at the new rate.
 
 `probe` is the investigation tool: it subscribes to any provider and reports what actually
 arrives, including raw payload bytes. Every hardcoded event layout in `src/runtime/` and
