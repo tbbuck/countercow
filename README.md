@@ -11,7 +11,7 @@ the gap `btop` closed over `top`, and then some:
 
 | | |
 |---|---|
-| **Watch** | Live counters with braille history graphs, laid out for the app you attached to. |
+| **Watch** | Live counters with gradient-filled history graphs, laid out for the app you attached to. |
 | **Investigate** | *What* is filling the heap, *why* each GC ran, what's throwing, what's blocking. |
 | **Profile** | A five-second CPU profile ranking methods by self time. |
 
@@ -20,16 +20,28 @@ protocols directly over a Unix socket — **no .NET SDK, no `dotnet-counters`, n
 at runtime**. Works against .NET 6 through 10, on Linux and macOS.
 
 ```
-┌ Heap size — 25.7 MiB ──────────────────────────────────┐┌ Memory ────────────┐
-│29.6 MiB│                                  ⣀⣀⣀⣀⣀⣀⡠⠤⠤⠤││Working set 118.5 MiB│
-│        │              ⣀⣀⣀⣀⡠⠤⠤⠤⠤⠒⠒⠒⠊⠉⠉⠉⠉          ││Heap size    25.7 MiB│
-│14.8 MiB│⠤⠤⠤⠤⠤⠤⠤⠤⠤⠤⠤⠔⠒⠒⠒⠉⠉⠉⠉                        ││Alloc rate 81.6 MiB/s│
-└────────────────────────────────────────────────────────┘└─────────────────────┘
-┌ Requests/sec — 101/s ──────────────────┐┌ Requests ────┐┌ Kestrel ───────────┐
-│116/s│              ⣀⣀⣀⣀⣀⣀⣀⣀⣀⣀⣀⣀⣀⣀⣀⣀⣀││Rate     101/s││Total          3,967│
-│58/s │⠉⠉⠉⠉⠉⠉⠉⠉⠉⠉⠉⠉⠉⠉⠉⠉⠉                ││Total    1,233││Conn queue         0│
-└─────────────────────────────────────────┘└──────────────┘└────────────────────┘
+╭ Heap size ──────────────────────────────────────── 25.3 MiB ╮╭ Memory ────────────────────╮
+│27.6 MiB                                   ⣀⣀⣀⣤⣤⣀⣀⣀⣀⣀⣀⣀⣀⣤⣤⣤⣤⣤││Working set        118.5 MiB│
+│                  ⢀⣀⣠⣤⣤⣤⣤⣤⣤⣤⣤⣶⣶⣶⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿││Heap size           25.7 MiB│
+│       ⣀⣠⣤⣴⣶⣶⣶⣶⣾⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿││Committed           15.2 MiB│
+│⣀⣠⣤⣴⣶⣾⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿││Alloc rate        81.6 MiB/s│
+│⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿││Fragmented            57.2 %│
+│⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿││                            │
+╰ -121s ──────────────────────────────────────────────────────╯╰────────────────────────────╯
+╭ Heap by generation ─────────────────────────────────────────╮╭ GC activity ───────────────╮
+│ ░░░░░░░░░░  ░░░░░░░░░░  ░░░░░░░░░░  ██████████  ░░░░░░░░░░░ ││Gen 0 GCs              3/min│
+│ ░░░░░░░░░░  ░░░░░░░░░░  ░░░░░░░░░░  ██████████  ░░░░░░░░░░░ ││Gen 1 GCs              3/min│
+│ ░░░░░░░░░░  ░░░░░░░░░░  ░░░░░░░░░░  ██████████  ░░░░░░░░░░░ ││Gen 2 GCs              3/min│
+│ ░░░░░░░░░░  ░░░░░░░░░░  ▁▁▁▁▁▁▁▁▁▁  ██████████  ░░░░░░░░░░░ ││Time in GC             0.0 %│
+│ ▁▁▁▁▁▁▁▁▁▁  ▁▁▁▁▁▁▁▁▁▁  ██████████  ██████████  ▂▂▂▂▂▂▂▂▂▂▂ ││Pause time            4.2 ms│
+│ 131.7 KiB    17.7 KiB   941.1 KiB    4.09 MiB    166.1 KiB  ││Gen 0 budget       119.2 MiB│
+│   Gen 0       Gen 1       Gen 2        LOH          POH     ││                            │
+╰─────────────────────────────────────────────────────────────╯╰────────────────────────────╯
 ```
+
+Every graph is filled from the baseline and coloured by height, so a spike changes colour as it
+climbs rather than only getting taller. One sample per sub-column, no interpolation: what you see
+is what the runtime reported, and the newest reading is always at the right edge.
 
 ## Usage
 
@@ -47,25 +59,32 @@ countercow ps              # list attachable processes and exit
 | `i` | investigate: allocations, GC causes, exceptions, contention |
 | `c` | CPU profile: which methods are burning time |
 | `p` | pause history (the session keeps running) |
-| `m` | switch braille / octant plotting |
+| `-` / `+` | refresh faster / slower |
+| `m` | cycle braille / block / octant plotting |
 | `?` | help |
 
 Detaching closes the EventPipe session properly and re-discovers processes, so it picks up
 anything that has started since — handy when the thing you want to watch is still building.
+
+`-` and `+` step the refresh rate between 0.25s and 10s (`--interval` sets the starting point).
+The runtime is told the rate when the counter session opens and there is no way to change it in
+place, so each step closes that session and opens another. History gathered at the old rate is
+dropped rather than spliced onto the new — the graphs place samples by index, so keeping it would
+silently stretch part of the trace.
 
 ## Investigating
 
 Counters tell you *that* the heap is growing. `i` tells you *what* is growing it:
 
 ```
-┌ Allocations by type ──────────────────────────────┐┌ Collections ─────────────────┐
-│System.Byte[]                    LOH  228.0 MiB 97.9%││#251  gen2 large alloc  4.0 ms│
-│System.String                    SOH  520.5 KiB  0.2%││#250  gen2 large alloc  4.3 ms│
-│System.IO.Pipelines.Pipe         SOH  312.5 KiB  0.1%││#249  gen2 large alloc  4.2 ms│
-└─────────────────────────────────────────────────────┘└──────────────────────────────┘
-┌ Exceptions thrown ────────────────────────────────┐┌ Lock contention ─────────────┐
-│System.InvalidOperationException  sample failure 1,425││Waits                      1  │
-└─────────────────────────────────────────────────────┘└──────────────────────────────┘
+╭ Allocations by type ───────────────────────────────────╮╭ Collections ─────────────╮
+│System.Byte[]                     LOH   228.0 MiB  97.9%││#251  gen2 large    4.0 ms│
+│System.String                     SOH   520.5 KiB   0.2%││#250  gen2 large    4.3 ms│
+│System.IO.Pipelines.Pipe          SOH   312.5 KiB   0.1%││#249  gen2 large    4.2 ms│
+╰────────────────────────────────────────────────────────╯╰──────────────────────────╯
+╭ Exceptions thrown ─────────────────────────────────────╮╭ Lock contention ─────────╮
+│System.InvalidOperationExcep sample failure        1,425││Waits                    1│
+╰────────────────────────────────────────────────────────╯╰──────────────────────────╯
 ```
 
 That reads as one causal story: byte arrays are going to the large object heap, which is forcing
