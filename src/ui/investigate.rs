@@ -4,13 +4,14 @@
 use ratatui::layout::{Constraint, Layout, Rect};
 use ratatui::style::{Style, Stylize};
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Block, Paragraph, Row, Table};
+use ratatui::widgets::{Paragraph, Row, Table};
 use ratatui::Frame;
 
 use crate::app::{format_uptime, App};
 use crate::counters::catalog::{format_bytes, format_count};
 use crate::runtime::state::{Collection, RuntimeState};
 
+use super::chart::bordered;
 use super::panels::titled_block;
 use super::theme::Theme;
 
@@ -52,7 +53,7 @@ pub fn render(frame: &mut Frame, app: &App, theme: &Theme) {
 }
 
 fn render_header(frame: &mut Frame, area: Rect, app: &App, theme: &Theme) {
-    let block = Block::bordered().border_style(Style::default().fg(theme.accent));
+    let block = bordered(theme).border_style(Style::default().fg(theme.accent));
     let inner = block.inner(area);
     frame.render_widget(block, area);
 

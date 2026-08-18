@@ -3,13 +3,13 @@
 use ratatui::layout::{Constraint, Layout, Rect};
 use ratatui::style::{Style, Stylize};
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Block, Clear, Paragraph};
+use ratatui::widgets::{Clear, Paragraph};
 use ratatui::Frame;
 
 use crate::app::{format_uptime, App, Status};
 use crate::counters::catalog;
 
-use super::chart::{self, TimeSeries};
+use super::chart::{self, Scale, TimeSeries};
 use super::panels;
 use super::theme::Theme;
 
@@ -52,7 +52,7 @@ pub fn render(frame: &mut Frame, app: &App, theme: &Theme) {
 }
 
 fn render_header(frame: &mut Frame, area: Rect, app: &App, theme: &Theme) {
-    let block = Block::bordered().border_style(Style::default().fg(theme.border));
+    let block = chart::bordered(theme);
     let inner = block.inner(area);
     frame.render_widget(block, area);
 
@@ -108,30 +108,50 @@ fn render_footer(frame: &mut Frame, area: Rect, app: &App, theme: &Theme) {
         Status::Failed(e) => (e.clone(), theme.bad),
     };
 
-    let line = Line::from(vec![
-        Span::from(" q").fg(theme.accent),
-        Span::from(" quit  ").fg(theme.dim),
-        Span::from("d").fg(theme.accent),
-        Span::from(" detach  ").fg(theme.dim),
-        Span::from("i").fg(theme.accent),
-        Span::from(" investigate  ").fg(theme.dim),
-        Span::from("c").fg(theme.accent),
-        Span::from(" cpu  ").fg(theme.dim),
-        Span::from("p").fg(theme.accent),
-        Span::from(" pause  ").fg(theme.dim),
-        Span::from("m").fg(theme.accent),
-        Span::from(format!(" {}  ", theme.marker_name())).fg(theme.dim),
-        Span::from("?").fg(theme.accent),
-        Span::from(" help").fg(theme.dim),
-    ]);
-
     let [left, right] =
         Layout::horizontal([Constraint::Fill(1), Constraint::Length(24)]).areas(area);
-    frame.render_widget(Paragraph::new(line), left);
+
+    // Least useful last: a narrow terminal drops whole hints from the right rather than clipping
+    // one in half. Help comes second despite reading oddly there, because it is the hint that
+    // gets you to all the others — losing it first would hide the rest of the keys entirely.
+    let hints = [
+        ("q", "quit".to_owned()),
+        ("?", "help".to_owned()),
+        ("i", "investigate".to_owned()),
+        ("c", "cpu".to_owned()),
+        ("d", "detach".to_owned()),
+        ("-/+", format_interval(app.interval)),
+        ("p", "pause".to_owned()),
+        ("m", theme.plot_name().to_owned()),
+    ];
+
+    let mut spans = Vec::new();
+    let mut used = 0usize;
+    for (key, label) in &hints {
+        let needed = key.chars().count() + label.chars().count() + 3;
+        if used + needed > left.width as usize {
+            break;
+        }
+        spans.push(Span::from(format!(" {key}")).fg(theme.accent));
+        spans.push(Span::from(format!(" {label} ")).fg(theme.dim));
+        used += needed;
+    }
+
+    frame.render_widget(Paragraph::new(Line::from(spans)), left);
     frame.render_widget(
         Paragraph::new(Line::from(Span::from(status_text).fg(status_color))).right_aligned(),
         right,
     );
+}
+
+/// Refresh rate as the footer shows it: a whole number of seconds loses its decimal point, and a
+/// fraction keeps only the digits it needs.
+fn format_interval(seconds: f64) -> String {
+    if seconds.fract().abs() < f64::EPSILON {
+        format!("{seconds:.0}s")
+    } else {
+        format!("{seconds}s")
+    }
 }
 
 /// Height the generation bars need before they are worth showing at all.
@@ -194,8 +214,8 @@ fn render_aspnet_body(frame: &mut Frame, area: Rect, app: &App, theme: &Theme) {
         TimeSeries {
             title: "Requests/sec",
             values: rps,
-            color: theme.good,
-            marker: theme.marker,
+            gradient: theme.rate,
+            scale: Scale::Auto,
             format: |v| format!("{v:.0}/s"),
             interval: app.interval,
         }
@@ -246,8 +266,10 @@ fn render_runtime_section(
         TimeSeries {
             title: "CPU usage",
             values: cpu,
-            color: theme.accent,
-            marker: theme.marker,
+            gradient: theme.cpu,
+            // The one counter with a real ceiling, so hold it: a process ticking over at 3% must
+            // not rescale into a chart that looks like it is on fire.
+            scale: Scale::Fixed(100.0),
             format: |v| format!("{v:.1}%"),
             interval: app.interval,
         }
@@ -292,8 +314,8 @@ fn render_bytes_chart(
     TimeSeries {
         title,
         values: &scaled,
-        color: theme.generations[0],
-        marker: theme.marker,
+        gradient: theme.heap,
+        scale: Scale::Auto,
         format: catalog::format_bytes,
         interval: app.interval,
     }
@@ -309,11 +331,17 @@ fn render_help(frame: &mut Frame, area: Rect, theme: &Theme) {
         Line::from("  i         investigate: allocations, GC causes, exceptions"),
         Line::from("  c         cpu profile: which methods are burning time"),
         Line::from("  p         pause history (session keeps running)"),
-        Line::from("  m         switch braille / octant plotting"),
+        Line::from("  - / +     refresh faster / slower"),
+        Line::from("  m         cycle braille / block / octant plotting"),
         Line::from("  ?         toggle this help"),
         Line::from(""),
         Line::from(Span::from("  Panels appear once their provider reports.").fg(theme.dim)),
         Line::from(Span::from("  ASP.NET panels are hidden for other processes.").fg(theme.dim)),
+        Line::from(""),
+        Line::from(
+            Span::from("  Changing the refresh rate reopens the counter session,").fg(theme.dim),
+        ),
+        Line::from(Span::from("  so the graphs restart from empty.").fg(theme.dim)),
         Line::from(""),
         Line::from(
             Span::from("  Investigating costs the target process CPU, so it runs").fg(theme.dim),
@@ -331,7 +359,7 @@ fn render_help(frame: &mut Frame, area: Rect, theme: &Theme) {
     };
 
     frame.render_widget(Clear, popup);
-    let block = Block::bordered()
+    let block = chart::bordered(theme)
         .border_style(Style::default().fg(theme.accent))
         .title(Span::from(" Help ").fg(theme.title).bold());
     let inner = block.inner(popup);

@@ -3,7 +3,7 @@
 use ratatui::layout::{Constraint, Layout, Rect};
 use ratatui::style::{Style, Stylize};
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Block, Paragraph, Row, Table, TableState};
+use ratatui::widgets::{Paragraph, Row, Table, TableState};
 use ratatui::Frame;
 
 use crate::ipc::commands::ProcessInfo;
@@ -182,7 +182,7 @@ impl Picker {
             ));
         }
 
-        let block = Block::bordered().border_style(Style::default().fg(theme.border));
+        let block = super::chart::bordered(theme);
         let inner = block.inner(area);
         frame.render_widget(block, area);
         frame.render_widget(Paragraph::new(lines), inner);
@@ -219,7 +219,7 @@ impl Picker {
         .column_spacing(2)
         .row_highlight_style(Style::default().fg(theme.accent).reversed())
         .highlight_symbol("")
-        .block(Block::bordered().border_style(Style::default().fg(theme.border)));
+        .block(super::chart::bordered(theme));
 
         frame.render_stateful_widget(table, area, &mut self.state);
     }

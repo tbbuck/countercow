@@ -49,8 +49,11 @@ fn app_from(fixture: &[u8]) -> App {
 }
 
 fn render(app: &App, width: u16, height: u16) -> String {
+    render_with(app, width, height, Theme::default())
+}
+
+fn render_with(app: &App, width: u16, height: u16, theme: Theme) -> String {
     let mut terminal = Terminal::new(TestBackend::new(width, height)).unwrap();
-    let theme = Theme::default();
     terminal.draw(|frame| dashboard::render(frame, app, &theme)).unwrap();
 
     let buffer = terminal.backend().buffer();
@@ -62,6 +65,11 @@ fn render(app: &App, width: u16, height: u16) -> String {
         out.push('\n');
     }
     out
+}
+
+/// The rows of one rendered frame, trailing blanks trimmed.
+fn rows(output: &str) -> Vec<&str> {
+    output.lines().map(|line| line.trim_end()).collect()
 }
 
 /// Sizes worth exercising: a comfortable window, a laptop split, the documented minimum, and
@@ -165,6 +173,100 @@ fn help_overlay_draws_over_the_dashboard() {
     let output = render(&app, 120, 40);
     assert!(output.contains("Help"));
     assert!(output.contains("pause history"));
+}
+
+#[test]
+fn the_generation_bars_use_the_whole_panel_width() {
+    // The point of the panel is comparing five sizes, so the bars should divide the width they
+    // are given rather than huddling at the left with the rest of it blank.
+    let output = render(&app_from(ASPNET), 200, 60);
+    let widest = rows(&output)
+        .iter()
+        .skip_while(|row| !row.contains("Heap by generation"))
+        .take_while(|row| !row.starts_with('╰'))
+        .map(|row| row.chars().filter(|c| "░▁▂▃▄▅▆▇█".contains(*c)).count())
+        .max()
+        .expect("the generation panel should be on screen");
+
+    // Five slots across a panel two thirds of a 200-column terminal wide.
+    assert!(widest > 100, "bars only covered {widest} columns of the panel");
+}
+
+#[test]
+fn every_generation_is_labelled_even_when_one_dwarfs_the_others() {
+    let output = render(&app_from(ASPNET), 120, 40);
+    for label in ["Gen 0", "Gen 1", "Gen 2", "LOH", "POH"] {
+        assert!(output.contains(label), "{label} missing from the generation panel");
+    }
+}
+
+#[test]
+fn either_every_generation_shows_its_share_or_none_does() {
+    // A width that does not divide by five leaves one slot a column wider than the rest. Letting
+    // that slot alone carry the share reads as a glitch, so the decision is made panel-wide.
+    for width in 90..=130 {
+        let output = render(&app_from(ASPNET), width, 40);
+        let captions = generation_captions(&output);
+        let shares = captions.matches('%').count();
+        assert!(
+            shares == 0 || shares == 5,
+            "{width} columns produced {shares} generation shares, not 0 or 5: {captions:?}"
+        );
+    }
+}
+
+/// The row of size captions under the generation bars.
+fn generation_captions(output: &str) -> String {
+    let all = rows(output);
+    let start = all
+        .iter()
+        .position(|row| row.contains("Heap by generation"))
+        .expect("the generation panel should be on screen");
+    let end = start
+        + all[start..]
+            .iter()
+            .position(|row| row.starts_with('╰'))
+            .expect("the generation panel should be closed");
+    // The labels sit on the last row inside the panel, the sizes on the one above.
+    all[end - 2].to_owned()
+}
+
+#[test]
+fn the_footer_shows_the_refresh_rate_and_how_to_change_it() {
+    let output = render(&app_from(ASPNET), 120, 40);
+    assert!(output.contains("-/+ 1s"), "the rate and its keys belong in the footer");
+}
+
+#[test]
+fn a_narrow_footer_drops_whole_hints_rather_than_half_a_word() {
+    let output = render(&app_from(ASPNET), 64, 20);
+    let footer = rows(&output).last().copied().unwrap_or_default().to_owned();
+    assert!(footer.contains("q quit"), "the first hint always survives: {footer:?}");
+    assert!(footer.contains("? help"), "help must survive, it reveals the other keys");
+    assert!(footer.chars().count() <= 64, "footer overflowed: {footer:?}");
+    for partial in ["investigat ", "detac ", "paus "] {
+        assert!(!footer.contains(partial), "hint cut mid-word: {footer:?}");
+    }
+}
+
+#[test]
+fn every_plot_family_renders_the_charts() {
+    let app = app_from(ASPNET);
+    let mut theme = Theme::default();
+    for expected in ["braille", "block", "octant"] {
+        assert_eq!(theme.plot_name(), expected);
+        let output = render_with(&app, 120, 40, theme);
+        assert!(output.contains("Heap size"), "{expected} lost the chart");
+        assert!(output.contains(expected), "the footer should name the plot family");
+        theme.cycle_plot();
+    }
+}
+
+#[test]
+fn the_charts_annotate_their_scale_and_span() {
+    let output = render(&app_from(ASPNET), 120, 40);
+    // How far back the trace goes belongs in the bottom border, clear of the plot itself.
+    assert!(output.contains("╰ -"), "no span label on any chart");
 }
 
 #[test]

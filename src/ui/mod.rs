@@ -6,6 +6,8 @@
 
 pub mod chart;
 pub mod dashboard;
+pub mod gradient;
+pub mod graph;
 pub mod investigate;
 pub mod panels;
 pub mod picker;
@@ -164,31 +166,20 @@ fn run_dashboard(
     interval: f64,
 ) -> Result<Exit> {
     let socket = process.socket.clone();
-    let session = session::start(&socket, interval)?;
-    let session_id = session.session_id;
-
     let (tx, rx) = bounded(CHANNEL_CAPACITY);
-    let stop = Arc::new(AtomicBool::new(false));
 
-    spawn_input_reader(tx.clone(), Arc::clone(&stop));
-    let tx_for_runtime = tx.clone();
-    spawn_session_reader(session.stream, interval, tx, Arc::clone(&stop));
+    let input_stop = Arc::new(AtomicBool::new(false));
+    spawn_input_reader(tx.clone(), Arc::clone(&input_stop));
+
+    // Opened before the first frame, so a target that cannot be traced reports why on the terminal
+    // instead of showing a dashboard that never fills in.
+    let counters = start_counters(&socket, interval, &tx)?;
 
     let mut app = App::new(process, info, interval);
     let mut theme = Theme::default();
-    let result = event_loop(terminal, &mut app, &mut theme, &rx, &tx_for_runtime, &socket);
+    let result = event_loop(terminal, &mut app, &mut theme, &rx, &tx, &socket, counters);
 
-    // Close the session properly rather than letting the socket drop, so the runtime tears down
-    // its EventPipe session promptly. This matters more now that detaching is possible: leaking
-    // a session per attach would accumulate in the target process.
-    stop.store(true, Ordering::Relaxed);
-    if let Err(e) = session::stop(&socket, session_id) {
-        // The usual cause is that the process already exited, which is not worth failing over.
-        if !matches!(app.status, Status::Ended) {
-            eprintln!("note: could not close the counter session cleanly: {e}");
-        }
-    }
-
+    input_stop.store(true, Ordering::Relaxed);
     result.map(|()| app.exit.unwrap_or(Exit::Quit))
 }
 
@@ -229,20 +220,84 @@ fn spawn_session_reader(
             ControlFlow::Continue(())
         });
 
+        // A session we asked to stop reaching EOF is not news. It matters on a rate change, where
+        // a replacement session is already running and must not be buried under the old one's
+        // obituary.
+        if stop.load(Ordering::Relaxed) {
+            return;
+        }
         let ended = match result {
             Ok(()) => AppEvent::SessionEnded(None),
-            // A read error after we asked to stop is just the socket closing under us.
-            Err(_) if stop.load(Ordering::Relaxed) => AppEvent::SessionEnded(None),
             Err(e) => AppEvent::SessionEnded(Some(e.to_string())),
         };
         let _ = tx.send(ended);
     });
 }
 
-/// A live investigation session, tracked so it can be closed the moment the user leaves.
-struct Investigation {
+/// A live session on the target, tracked so it can be closed the moment it is not wanted.
+struct Session {
     session_id: u64,
     stop: Arc<AtomicBool>,
+}
+
+impl Session {
+    /// Tell the reader thread to stop reporting. Its socket reaching EOF is expected from here on.
+    fn silence(&self) {
+        self.stop.store(true, Ordering::Relaxed);
+    }
+}
+
+fn start_counters(socket: &std::path::Path, interval: f64, tx: &Sender<AppEvent>) -> Result<Session> {
+    let session = session::start(socket, interval)?;
+    let stop = Arc::new(AtomicBool::new(false));
+    spawn_session_reader(session.stream, interval, tx.clone(), Arc::clone(&stop));
+    Ok(Session { session_id: session.session_id, stop })
+}
+
+/// Tear the counter session down and open another at `interval`.
+///
+/// The rate is fixed when a session is created — the runtime is told it as provider filter data —
+/// so the only way to change it is to ask for a new session. If the old one will not close, stop
+/// there rather than stacking a second on top: its reader thread is blocked on a socket that now
+/// has no way to reach EOF, and every further rate change would leak another of each.
+fn restart_counters(
+    counters: &mut Option<Session>,
+    socket: &std::path::Path,
+    tx: &Sender<AppEvent>,
+    interval: f64,
+) -> std::result::Result<(), String> {
+    if let Some(active) = counters.take() {
+        active.silence();
+        if let Err(e) = session::stop(socket, active.session_id) {
+            return Err(format!("could not close the counter session: {e}"));
+        }
+    }
+
+    match start_counters(socket, interval, tx) {
+        Ok(session) => {
+            *counters = Some(session);
+            Ok(())
+        }
+        Err(e) => Err(format!("could not restart counters at {interval}s: {e}")),
+    }
+}
+
+/// Close the counter session at the end of a dashboard.
+///
+/// Closing it properly rather than letting the socket drop makes the runtime tear its EventPipe
+/// session down promptly, which matters because detaching is possible: a session leaked per attach
+/// would accumulate in the target process.
+fn stop_counters(counters: &mut Option<Session>, socket: &std::path::Path, app: &App) {
+    let Some(active) = counters.take() else {
+        return;
+    };
+    active.silence();
+    if let Err(e) = session::stop(socket, active.session_id) {
+        // The usual cause is that the process already exited, which is not worth failing over.
+        if !matches!(app.status, Status::Ended) {
+            eprintln!("note: could not close the counter session cleanly: {e}");
+        }
+    }
 }
 
 fn event_loop(
@@ -252,9 +307,11 @@ fn event_loop(
     rx: &Receiver<AppEvent>,
     tx: &Sender<AppEvent>,
     socket: &std::path::Path,
+    counters: Session,
 ) -> Result<()> {
-    let mut investigation: Option<Investigation> = None;
-    let mut profiling: Option<Investigation> = None;
+    let mut counters = Some(counters);
+    let mut investigation: Option<Session> = None;
+    let mut profiling: Option<Session> = None;
 
     let result = (|| -> Result<()> {
         loop {
@@ -275,6 +332,15 @@ fn event_loop(
             }
             while let Ok(event) = rx.try_recv() {
                 handle_event(app, theme, event);
+            }
+
+            // A new refresh rate means a new counter session; the runtime is told the rate when
+            // the session opens and there is no way to change it in place.
+            if let Some(interval) = app.take_pending_interval() {
+                match restart_counters(&mut counters, socket, tx, interval) {
+                    Ok(()) => app.apply_interval(interval),
+                    Err(error) => app.status = Status::Failed(error),
+                }
             }
 
             // Reconcile the session with the screen. Runtime events cost the target real CPU, so
@@ -308,6 +374,7 @@ fn event_loop(
 
     stop_investigation(&mut investigation, socket);
     stop_profile(&mut profiling, socket);
+    stop_counters(&mut counters, socket, app);
     result
 }
 
@@ -315,7 +382,7 @@ fn start_profile(
     app: &mut App,
     tx: &Sender<AppEvent>,
     socket: &std::path::Path,
-) -> Option<Investigation> {
+) -> Option<Session> {
     let session = match profile_session::start(socket) {
         Ok(session) => session,
         Err(e) => {
@@ -327,10 +394,10 @@ fn start_profile(
     let session_id = session.session_id;
     let stop = Arc::new(AtomicBool::new(false));
     spawn_profile_reader(session.stream, tx.clone());
-    Some(Investigation { session_id, stop })
+    Some(Session { session_id, stop })
 }
 
-fn stop_profile(profiling: &mut Option<Investigation>, socket: &std::path::Path) {
+fn stop_profile(profiling: &mut Option<Session>, socket: &std::path::Path) {
     let Some(active) = profiling.take() else {
         return;
     };
@@ -361,7 +428,7 @@ fn start_investigation(
     app: &mut App,
     tx: &Sender<AppEvent>,
     socket: &std::path::Path,
-) -> Option<Investigation> {
+) -> Option<Session> {
     let session = match runtime_session::start(socket) {
         Ok(session) => session,
         Err(e) => {
@@ -373,10 +440,10 @@ fn start_investigation(
     let session_id = session.session_id;
     let stop = Arc::new(AtomicBool::new(false));
     spawn_runtime_reader(session.stream, tx.clone(), Arc::clone(&stop));
-    Some(Investigation { session_id, stop })
+    Some(Session { session_id, stop })
 }
 
-fn stop_investigation(investigation: &mut Option<Investigation>, socket: &std::path::Path) {
+fn stop_investigation(investigation: &mut Option<Session>, socket: &std::path::Path) {
     let Some(active) = investigation.take() else {
         return;
     };
@@ -487,7 +554,11 @@ fn handle_key(app: &mut App, theme: &mut Theme, key: KeyEvent) {
         KeyCode::Char('i') => app.toggle_investigate(),
         KeyCode::Char('c') => app.start_profile(),
         KeyCode::Char('p') | KeyCode::Char(' ') => app.paused = !app.paused,
-        KeyCode::Char('m') => theme.toggle_marker(),
+        KeyCode::Char('m') => theme.cycle_plot(),
+        // btop's convention: `+` adds to the update timer and so slows it down. Both faces of each
+        // key are bound, because whether you get `+` or `=` depends on the shift key.
+        KeyCode::Char('-') | KeyCode::Char('_') => app.step_interval(true),
+        KeyCode::Char('+') | KeyCode::Char('=') => app.step_interval(false),
         KeyCode::Char('?') | KeyCode::Char('h') => app.show_help = true,
         _ => {}
     }
@@ -558,10 +629,40 @@ mod tests {
     }
 
     #[test]
-    fn m_switches_the_plot_marker() {
+    fn m_switches_the_plot_glyphs() {
         let mut theme = Theme::default();
         handle_key(&mut app(), &mut theme, press(KeyCode::Char('m')));
-        assert_eq!(theme.marker_name(), "octant");
+        assert_eq!(theme.plot_name(), "block");
+    }
+
+    #[test]
+    fn minus_asks_for_a_faster_rate_and_plus_a_slower_one() {
+        let mut app = app();
+        handle_key(&mut app, &mut Theme::default(), press(KeyCode::Char('-')));
+        assert_eq!(app.take_pending_interval(), Some(0.5));
+
+        handle_key(&mut app, &mut Theme::default(), press(KeyCode::Char('+')));
+        assert_eq!(app.take_pending_interval(), Some(2.0));
+    }
+
+    #[test]
+    fn the_unshifted_faces_of_the_rate_keys_work_too() {
+        // Whether the key reports `+` or `=` depends on the shift key, and both should step.
+        let mut app = app();
+        handle_key(&mut app, &mut Theme::default(), press(KeyCode::Char('=')));
+        assert_eq!(app.take_pending_interval(), Some(2.0));
+
+        handle_key(&mut app, &mut Theme::default(), press(KeyCode::Char('_')));
+        assert_eq!(app.take_pending_interval(), Some(0.5));
+    }
+
+    #[test]
+    fn the_rate_keys_do_nothing_on_the_other_screens() {
+        // Those sessions carry no interval, and restarting counters underneath them is pointless.
+        let mut app = app();
+        app.toggle_investigate();
+        handle_key(&mut app, &mut Theme::default(), press(KeyCode::Char('-')));
+        assert_eq!(app.take_pending_interval(), None);
     }
 
     #[test]

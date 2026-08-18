@@ -3,16 +3,18 @@
 use ratatui::layout::{Constraint, Rect};
 use ratatui::style::{Style, Stylize};
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Bar, BarChart, BarGroup, Block, Gauge, Row, Table};
+use ratatui::widgets::{Block, BorderType, Row, Table};
 use ratatui::Frame;
 
 use crate::app::App;
 use crate::counters::catalog;
 
+use super::graph;
 use super::theme::Theme;
 
 pub fn titled_block<'a>(title: &str, theme: &Theme) -> Block<'a> {
     Block::bordered()
+        .border_type(BorderType::Rounded)
         .border_style(Style::default().fg(theme.border))
         .title(Span::from(format!(" {title} ")).fg(theme.title).bold())
 }
@@ -48,12 +50,99 @@ pub fn stats(frame: &mut Frame, area: Rect, theme: &Theme, title: &str, rows: &[
     frame.render_widget(table, inner);
 }
 
+/// Rows the generation bars give up to the value and label beneath each bar.
+const BAR_CAPTION_ROWS: u16 = 2;
+
+/// Slot width at which each caption can carry its share of the heap as well as its size.
+const SHARE_FITS_AT: u16 = 13;
+
 /// GC generation sizes side by side.
 ///
-/// A bar chart rather than overlaid lines: five series in one braille chart would blend colours
-/// where they cross, and the interesting comparison here is relative size at a glance anyway.
+/// Bars rather than overlaid lines: five series in one chart would share cells and blend, and the
+/// interesting comparison here is relative size at a glance anyway. The bars divide the full width
+/// between them, so the panel is as wide as whatever it has been given rather than leaving a gap.
 pub fn generation_bars(frame: &mut Frame, area: Rect, theme: &Theme, app: &App) {
     let block = titled_block("Heap by generation", theme);
+    let inner = block.inner(area);
+    frame.render_widget(block, area);
+
+    if inner.height <= BAR_CAPTION_ROWS || inner.width < catalog::GENERATION_COUNTERS.len() as u16 {
+        return;
+    }
+
+    let labels = ["Gen 0", "Gen 1", "Gen 2", "LOH", "POH"];
+    let sizes: Vec<f64> = catalog::GENERATION_COUNTERS
+        .iter()
+        .map(|counter| {
+            app.latest(catalog::SYSTEM_RUNTIME, counter)
+                .and_then(catalog::bytes_value)
+                .unwrap_or(0.0)
+                .max(0.0)
+        })
+        .collect();
+
+    let largest = sizes.iter().copied().fold(0.0, f64::max);
+    let total: f64 = sizes.iter().sum();
+    let slots = sizes.len() as u16;
+
+    // Decided once for the panel, from the narrowest slot. Deciding per slot would let a width
+    // that does not divide evenly give the share to whichever slot got the spare column, which
+    // reads as a glitch rather than as a layout.
+    let show_share = total > 0.0 && inner.width / slots >= SHARE_FITS_AT;
+
+    let bar_area = Rect { height: inner.height - BAR_CAPTION_ROWS, ..inner };
+    let value_y = inner.y + inner.height - 2;
+    let label_y = inner.y + inner.height - 1;
+
+    for (index, (&bytes, label)) in sizes.iter().zip(labels).enumerate() {
+        // Divide by position rather than by a fixed width, so the leftover columns of an
+        // indivisible width are spread across the slots instead of left blank at the right edge.
+        let start = inner.width * index as u16 / slots;
+        let end = inner.width * (index as u16 + 1) / slots;
+        let slot = Rect { x: inner.x + start, width: end - start, ..inner };
+
+        // A column of breathing room each side, once there is width to spare for it.
+        let padding = u16::from(slot.width >= 5);
+        let column = Rect {
+            x: slot.x + padding,
+            width: slot.width - padding * 2,
+            y: bar_area.y,
+            height: bar_area.height,
+        };
+        if largest > 0.0 {
+            let gradient = theme.generation_gradient(index);
+            graph::vertical_bar(
+                frame.buffer_mut(),
+                column,
+                bytes / largest,
+                &gradient,
+                theme.depth,
+                theme.dim,
+            );
+        }
+
+        let mut caption = catalog::format_bytes(bytes);
+        if show_share {
+            caption = format!("{caption} {:.0}%", bytes / total * 100.0);
+        }
+        let colour = theme.on(&theme.generation_gradient(index), 0.5);
+        centred(frame, slot, value_y, &caption, Style::default().fg(colour));
+        centred(frame, slot, label_y, label, Style::default().fg(theme.dim));
+    }
+}
+
+/// Write `text` centred in `slot` on row `y`, or nothing if it does not fit.
+fn centred(frame: &mut Frame, slot: Rect, y: u16, text: &str, style: Style) {
+    let width = text.chars().count() as u16;
+    if width > slot.width {
+        return;
+    }
+    frame.buffer_mut().set_string(slot.x + (slot.width - width) / 2, y, text, style);
+}
+
+/// A labelled percentage meter, filled along the ramp so the colour says how full it is.
+pub fn percent_gauge(frame: &mut Frame, area: Rect, theme: &Theme, title: &str, percent: Option<f64>) {
+    let block = titled_block(title, theme);
     let inner = block.inner(area);
     frame.render_widget(block, area);
 
@@ -61,57 +150,33 @@ pub fn generation_bars(frame: &mut Frame, area: Rect, theme: &Theme, app: &App) 
         return;
     }
 
-    let labels = ["Gen 0", "Gen 1", "Gen 2", "LOH", "POH"];
-    let bars: Vec<Bar> = catalog::GENERATION_COUNTERS
-        .iter()
-        .zip(labels)
-        .zip(theme.generations)
-        .map(|((counter, label), color)| {
-            let bytes = app
-                .latest(catalog::SYSTEM_RUNTIME, counter)
-                .and_then(catalog::bytes_value)
-                .unwrap_or(0.0);
-            Bar::default()
-                .value(bytes.max(0.0) as u64)
-                .label(Line::from(label))
-                .text_value(catalog::format_bytes(bytes))
-                .style(Style::default().fg(color))
-                .value_style(Style::default().fg(color).reversed())
-        })
-        .collect();
-
-    // Share the width between five bars, leaving a column of gap between each.
-    let bar_width = ((inner.width as usize).saturating_sub(4) / 5).clamp(3, 12) as u16;
-
-    let chart = BarChart::default()
-        .data(BarGroup::default().bars(&bars))
-        .bar_width(bar_width)
-        .bar_gap(1)
-        .label_style(Style::default().fg(theme.dim));
-    frame.render_widget(chart, inner);
-}
-
-/// A labelled percentage bar.
-pub fn percent_gauge(frame: &mut Frame, area: Rect, theme: &Theme, title: &str, percent: Option<f64>) {
-    let block = titled_block(title, theme);
-    let inner = block.inner(area);
-    frame.render_widget(block, area);
-
-    if inner.height == 0 {
-        return;
-    }
-
-    let value = percent.unwrap_or(0.0).clamp(0.0, 100.0);
     let label = match percent {
-        Some(v) => format!("{v:.1} %"),
+        Some(value) => format!("{value:.1} %"),
         None => "—".into(),
     };
+    // A leading space keeps the number off the meter's last block.
+    let label_width = (label.chars().count() as u16 + 1).min(inner.width);
+    let meter_width = inner.width - label_width;
 
-    let gauge = Gauge::default()
-        .gauge_style(Style::default().fg(theme.for_percent(value)))
-        .ratio(value / 100.0)
-        .label(Span::from(label).fg(theme.fg));
-    frame.render_widget(gauge, Rect { height: 1, ..inner });
+    graph::meter(
+        frame.buffer_mut(),
+        Rect { width: meter_width, height: 1, ..inner },
+        percent.unwrap_or(0.0) / 100.0,
+        &theme.cpu,
+        theme.depth,
+        theme.dim,
+    );
+
+    // Bounded rather than written straight out: a counter reporting something absurd would
+    // otherwise run the label past this panel and into whatever is drawn to the right of it.
+    let colour = theme.for_percent(percent.unwrap_or(0.0));
+    frame.buffer_mut().set_stringn(
+        inner.x + meter_width + 1,
+        inner.y,
+        &label,
+        label_width.saturating_sub(1) as usize,
+        Style::default().fg(colour),
+    );
 }
 
 /// Rows for the GC activity panel.
