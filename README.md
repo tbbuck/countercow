@@ -251,6 +251,34 @@ scripts/drive-load.sh http://localhost:5199 20
 countercow --name CounterCowSampleApi
 ```
 
+## Releases
+
+Every push to `main` bumps the minor version, tags it and builds
+[a release](https://github.com/tbbuck/countercow/releases) — so the minor number counts pushes
+rather than describing them, and there is no release ritual to forget to perform.
+
+`Cargo.toml` therefore holds the version that was last *released*, not the one being worked on:
+the bump is part of releasing, so it happens in CI rather than in the commit that earned it.
+
+Prebuilt binaries cover Linux and macOS, x86-64 and arm64 each
+(`{x86_64,aarch64}-unknown-linux-gnu`, `{x86_64,aarch64}-apple-darwin`). Every one is a `.tar.gz`
+holding the binary, this README and the licence, with a `SHA256SUMS` alongside to check them
+against:
+
+```bash
+tar xzf countercow-1.3.0-aarch64-apple-darwin.tar.gz
+sudo install countercow-1.3.0-aarch64-apple-darwin/countercow /usr/local/bin
+```
+
+There is no Windows build. The diagnostics protocol is the same there, but it arrives over a named
+pipe rather than a Unix socket, so supporting it is a piece of work rather than a build target.
+
+Two things the binaries do not do for you. The Linux ones link against the glibc of the runner that
+built them, so a distribution more than a couple of years old wants a [build from
+source](#building) instead. The macOS ones are not notarised, so a browser download arrives
+quarantined — `xattr -d com.apple.quarantine` on the extracted binary clears it, and fetching with
+`curl` never sets it in the first place.
+
 ## Licence
 
 MIT — see [LICENSE](LICENSE).

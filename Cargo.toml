@@ -1,6 +1,6 @@
 [package]
 name = "countercow"
-version = "0.1.0"
+version = "1.2.0"
 edition = "2021"
 # Held down deliberately. The only thing that wanted more was sysinfo 0.39, which jumped to
 # 1.95 for no feature this uses; 0.38 does the same job at 1.88. Everything else in the tree,

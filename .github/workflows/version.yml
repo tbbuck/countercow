@@ -1,0 +1,102 @@
+name: Version
+
+# Every push to main gets a version and a release. The number is a serial, not a judgement about
+# how large the change was, so nothing here decides anything — it counts.
+on:
+  push:
+    branches: [main]
+
+jobs:
+  bump:
+    name: bump and tag
+    # Two pushes landing close together must not both compute the same next version. Serialising
+    # means the second one checks out a main that already carries the first one's bump. The group
+    # is on this job rather than the workflow so that a queued bump waits for the previous bump
+    # only, not for the release build hanging off it.
+    concurrency:
+      group: version-bump
+      cancel-in-progress: false
+    # The bump is itself a push to main, so without this the workflow would trigger itself for
+    # ever. `[skip ci]` in the commit message would work too, but it is deliberately not used: it
+    # would also suppress the tag-triggered path in release.yml, which is the path anyone who
+    # later swaps in a PAT would be relying on.
+    if: ${{ !startsWith(github.event.head_commit.message, 'Release v') }}
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    outputs:
+      tag: ${{ steps.bump.outputs.tag }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          # main's tip, not the commit that triggered this run. If a second push arrived while
+          # this one was queued, the bump has to sit on top of what main is now — otherwise both
+          # runs read the same version out of Cargo.toml and race for the same tag.
+          ref: main
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - name: Bump the minor version
+        id: bump
+        run: |
+          set -euo pipefail
+
+          current="$(grep -m1 '^version = ' Cargo.toml | cut -d'"' -f2)"
+          major="${current%%.*}"
+          rest="${current#*.}"
+          minor="${rest%%.*}"
+          next="$major.$((minor + 1)).0"
+
+          # Only the first `version = ` line, which is the one in [package]. Dependency versions
+          # are inline tables, so they never start a line, but the range keeps that true even if
+          # one is reformatted later.
+          sed -i "0,/^version = / s/^version = \".*\"/version = \"$next\"/" Cargo.toml
+          if [ "$(grep -m1 '^version = ' Cargo.toml | cut -d'"' -f2)" != "$next" ]; then
+              echo "Failed to rewrite the version in Cargo.toml" >&2
+              exit 1
+          fi
+
+          # --workspace touches only countercow's own entry in the lockfile. A bare `cargo update`
+          # would take every dependency to its newest compatible release as a side effect of a
+          # version bump, which is how an MSRV floor moves without anyone deciding to move it.
+          cargo update --workspace
+
+          # A tag that already exists means someone tagged out of band; say so here rather than
+          # letting the push fail with git's wording several steps later.
+          if git ls-remote --exit-code --tags origin "refs/tags/v$next" >/dev/null 2>&1; then
+              echo "Tag v$next already exists on the remote" >&2
+              exit 1
+          fi
+
+          echo "tag=v$next" >> "$GITHUB_OUTPUT"
+          echo "Bumping $current -> $next"
+
+      - name: Commit and tag
+        env:
+          TAG: ${{ steps.bump.outputs.tag }}
+        run: |
+          set -euo pipefail
+
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add Cargo.toml Cargo.lock
+          git commit -m "Release $TAG"
+          git tag "$TAG"
+          # --atomic so the branch and the tag land together or not at all. A tag without the
+          # commit that names it would build a release for a version main does not claim.
+          git push --atomic origin HEAD:main "refs/tags/$TAG"
+
+  release:
+    # Calling release.yml rather than letting the tag push trigger it. A push made with the
+    # default GITHUB_TOKEN does not trigger workflows, so the tag alone would sit there and no
+    # binaries would ever be built. A personal access token would restore the trigger, at the
+    # cost of a secret to create, store and rotate, and of releases running as a human rather
+    # than as the bot. Calling directly needs nothing beyond what the repo already has.
+    needs: bump
+    permissions:
+      # A called workflow cannot hold more than its caller grants, so the write it needs to
+      # create the release has to be granted here as well as there.
+      contents: write
+    uses: ./.github/workflows/release.yml
+    with:
+      tag: ${{ needs.bump.outputs.tag }}

@@ -306,7 +306,7 @@ dependencies = [
 
 [[package]]
 name = "countercow"
-version = "0.1.0"
+version = "1.2.0"
 dependencies = [
  "clap",
  "color-eyre",
