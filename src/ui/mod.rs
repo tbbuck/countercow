@@ -83,18 +83,26 @@ fn session_loop(
     target: &mut Option<DotnetProcess>,
     interval: f64,
 ) -> Result<()> {
+    // Carried across detaches rather than rebuilt per process. A rate and a plot chosen while
+    // looking at one process are almost always the right ones for the next, and resetting them on
+    // every detach makes the keys feel as though they had not taken.
+    let mut interval = interval;
+    let mut theme = Theme::default();
+
     loop {
         // `--pid`/`--name` supply the first target; after a detach we always return to the picker.
         let process = match target.take() {
             Some(process) => process,
-            None => match pick_process(terminal)? {
+            None => match pick_process(terminal, &theme)? {
                 Some(process) => process,
                 None => return Ok(()),
             },
         };
 
         let info = commands::process_info(&process.socket)?;
-        match run_dashboard(terminal, process, info, interval)? {
+        let (exit, ended_at) = run_dashboard(terminal, process, info, interval, &mut theme)?;
+        interval = ended_at;
+        match exit {
             Exit::Quit => return Ok(()),
             Exit::Detach => continue,
         }
@@ -102,7 +110,7 @@ fn session_loop(
 }
 
 /// Show the picker and return the chosen process, or `None` if the user quit.
-fn pick_process(terminal: &mut DefaultTerminal) -> Result<Option<DotnetProcess>> {
+fn pick_process(terminal: &mut DefaultTerminal, theme: &Theme) -> Result<Option<DotnetProcess>> {
     // Re-discover every time: processes come and go while countercow is running, and a detach is
     // usually motivated by wanting something that has just started.
     let found = discovery::discover()?;
@@ -120,7 +128,7 @@ fn pick_process(terminal: &mut DefaultTerminal) -> Result<Option<DotnetProcess>>
         .collect();
 
     let mut picker = Picker::new(found, entries);
-    run_picker(terminal, &mut picker, &Theme::default())?;
+    run_picker(terminal, &mut picker, theme)?;
 
     Ok(if picker.cancelled {
         None
@@ -185,12 +193,15 @@ fn run_picker(terminal: &mut DefaultTerminal, picker: &mut Picker, theme: &Theme
 }
 
 /// Attach to a process and run the dashboard until the user leaves or the process exits.
+///
+/// Returns how it ended and the refresh rate it was running at, which the next attach starts from.
 fn run_dashboard(
     terminal: &mut DefaultTerminal,
     process: DotnetProcess,
     info: ProcessInfo,
     interval: f64,
-) -> Result<Exit> {
+    theme: &mut Theme,
+) -> Result<(Exit, f64)> {
     let socket = process.socket.clone();
     let (tx, rx) = bounded(CHANNEL_CAPACITY);
 
@@ -202,11 +213,12 @@ fn run_dashboard(
     let counters = start_counters(&socket, interval, &tx)?;
 
     let mut app = App::new(process, info, interval);
-    let mut theme = Theme::default();
-    let result = event_loop(terminal, &mut app, &mut theme, &rx, &tx, &socket, counters);
+    let result = event_loop(terminal, &mut app, theme, &rx, &tx, &socket, counters);
 
     input_stop.store(true, Ordering::Relaxed);
-    result.map(|()| app.exit.unwrap_or(Exit::Quit))
+    // The wanted rate rather than the live one: detaching within the settle window would
+    // otherwise discard the last press, which the corner of the screen had already acknowledged.
+    result.map(|()| (app.exit.unwrap_or(Exit::Quit), app.wanted_interval()))
 }
 
 fn spawn_input_reader(tx: Sender<AppEvent>, stop: Arc<AtomicBool>) {

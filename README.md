@@ -59,6 +59,10 @@ countercow ps              # list attachable processes and exit
 Detaching closes the EventPipe session properly and re-discovers processes, so it picks up
 anything that has started since — handy when the thing you want to watch is still building.
 
+The refresh rate and the plot family carry across a detach. They are choices about how you want
+to look at things rather than about the process you were looking at, and having them snap back to
+the defaults on every detach made the keys feel as though they had not taken.
+
 Being killed rather than quit is handled too: `SIGTERM` and `SIGHUP` leave by the same door as
 `q`, so a `kill` or a dropped SSH connection does not leave the terminal in raw mode and inside
 the alternate screen. A second signal kills outright, so nothing here can make countercow
