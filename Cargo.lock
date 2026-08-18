@@ -312,6 +312,7 @@ dependencies = [
  "color-eyre",
  "crossbeam-channel",
  "crossterm",
+ "libc",
  "ratatui",
  "sysinfo",
 ]

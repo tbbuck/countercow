@@ -12,6 +12,7 @@ pub mod investigate;
 pub mod panels;
 pub mod picker;
 pub mod profile;
+pub mod signals;
 pub mod theme;
 
 use std::ops::ControlFlow;
@@ -68,6 +69,10 @@ fn ensure_terminal() -> Result<()> {
 pub fn run(mut target: Option<DotnetProcess>, interval: f64) -> Result<()> {
     ensure_terminal()?;
     let mut terminal = ratatui::init();
+    // Only from here: before this the terminal is untouched, so the default dispositions are
+    // already the right ones.
+    signals::listen();
+
     let result = session_loop(&mut terminal, &mut target, interval);
     ratatui::restore();
     result
@@ -128,7 +133,28 @@ fn run_picker(terminal: &mut DefaultTerminal, picker: &mut Picker, theme: &Theme
     loop {
         terminal.draw(|frame| picker.render(frame, theme))?;
 
-        let Event::Key(key) = crossterm::event::read()? else {
+        if signals::interrupted() {
+            picker.cancelled = true;
+            return Ok(());
+        }
+
+        // Polled rather than blocked on, so a signal is noticed within a frame. Waiting for a
+        // keypress instead would mean a `kill` on a picker nobody is typing at did nothing at all
+        // until someone pressed something.
+        match crossterm::event::poll(FRAME_INTERVAL) {
+            Ok(true) => {}
+            Ok(false) => continue,
+            // The terminal has gone; there is nothing left to pick with.
+            Err(_) => {
+                picker.cancelled = true;
+                return Ok(());
+            }
+        }
+        let Ok(event) = crossterm::event::read() else {
+            picker.cancelled = true;
+            return Ok(());
+        };
+        let Event::Key(key) = event else {
             continue;
         };
         // Windows sends both press and release; only act once.
@@ -365,6 +391,11 @@ fn event_loop(
                 _ => {}
             }
 
+            // A signal asked us to stop. Leaving by the same door as `q` is what restores the
+            // terminal and closes the session, rather than dying mid-frame and leaving both.
+            if signals::interrupted() {
+                app.exit = Some(Exit::Quit);
+            }
             if app.exit.is_some() {
                 return Ok(());
             }

@@ -59,6 +59,12 @@ countercow ps              # list attachable processes and exit
 Detaching closes the EventPipe session properly and re-discovers processes, so it picks up
 anything that has started since — handy when the thing you want to watch is still building.
 
+Being killed rather than quit is handled too: `SIGTERM` and `SIGHUP` leave by the same door as
+`q`, so a `kill` or a dropped SSH connection does not leave the terminal in raw mode and inside
+the alternate screen. A second signal kills outright, so nothing here can make countercow
+unkillable. The counter session needs no such care — the runtime tears an EventPipe session down
+when the client's socket closes, in under three seconds even after a `SIGKILL`.
+
 Counters start flowing the moment you attach — the session opens before the first frame, and
 nothing needs starting by hand. (Investigating and profiling are the exceptions, and deliberately
 so: both cost the target real CPU, so they run only while you are looking at them.)

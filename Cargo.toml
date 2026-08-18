@@ -18,6 +18,9 @@ clap = { version = "4", features = ["derive"] }
 color-eyre = "0.6"
 crossbeam-channel = "0.5"
 crossterm = "0.29"
+# Already in the tree several times over as a transitive dependency; declared here only to catch
+# SIGTERM and SIGHUP, so being killed does not leave the terminal in raw mode.
+libc = "0.2"
 ratatui = "0.30.2"
 # Pinned exactly: sysinfo changes its API across minor versions, so a float here breaks builds
 # rather than just moving them.
