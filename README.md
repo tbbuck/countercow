@@ -253,9 +253,11 @@ countercow --name CounterCowSampleApi
 
 ## Releases
 
-Every push to `main` bumps the minor version, tags it and builds
+Every push to `main` runs the tests, and if they pass bumps the minor version, tags it and builds
 [a release](https://github.com/tbbuck/countercow/releases) — so the minor number counts pushes
-rather than describing them, and there is no release ritual to forget to perform.
+rather than describing them, and there is no release ritual to forget to perform. It is one
+workflow rather than several because the ordering is the point: nothing is tagged until the tests
+have agreed to it, which separate workflows triggered by the same push cannot express.
 
 `Cargo.toml` therefore holds the version that was last *released*, not the one being worked on:
 the bump is part of releasing, so it happens in CI rather than in the commit that earned it.

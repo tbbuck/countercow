@@ -1,0 +1,286 @@
+name: countercow
+
+# One workflow rather than three, because the ordering matters and only `needs` can express it.
+# As separate workflows the tests and the release were triggered by the same push and ran side by
+# side, so a release could — and on a red build would — publish before the tests had finished
+# disagreeing with it. Here nothing is tagged until both test jobs are green.
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  # Building a tag again by hand, for when a release fails somewhere after the tag was pushed.
+  # Without this the only way back is another bump, which burns a version number to fix a flake.
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: An existing tag to build and publish again, e.g. v1.3.0
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+concurrency:
+  group: countercow-${{ github.ref }}
+  # A superseded pull request run is wasted work. A superseded push is not: it may already have
+  # bumped the version, and cancelling it would leave a tag behind with no release against it.
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+jobs:
+  test:
+    name: clippy and tests (${{ matrix.os }})
+    # A hand-triggered rebuild is of a tag that already passed this on the way out.
+    if: github.event_name != 'workflow_dispatch'
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 10
+    strategy:
+      fail-fast: false
+      matrix:
+        # Linux and macOS both, because the two things this binary touches most — the socket
+        # directory ($TMPDIR differs) and thread-time sampling — behave differently on each.
+        # No Windows: the IPC layer is std::os::unix::net::UnixStream, so it does not build there.
+        os: [ubuntu-latest, macos-latest]
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+
+      - uses: Swatinem/rust-cache@v2
+
+      # Lints but no `cargo fmt --check`, deliberately: this repo is not rustfmt-clean, because
+      # several byte-layout tables are laid out by hand to be read as tables and rustfmt unpicks
+      # them. Formatting is not the thing worth failing a build over here; warnings are.
+      - name: Clippy
+        run: cargo clippy --all-targets --locked -- -D warnings
+
+      - name: Tests
+        run: cargo test --locked
+
+  msrv:
+    name: build on the declared MSRV (1.88)
+    if: github.event_name != 'workflow_dispatch'
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          # Cargo.toml claims 1.88 and the README claims it is verified rather than declared.
+          # This is that verification: a dependency that quietly raises its own floor breaks the
+          # claim, and only building on the old compiler catches it.
+          toolchain: "1.88"
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: msrv
+
+      # --locked matters more here than anywhere else: the committed lockfile is what holds the
+      # dependency versions down to ones that still compile on 1.88. Resolving afresh would pull
+      # newer minors and test a tree nobody ships.
+      - name: Build
+        run: cargo build --locked
+
+  version:
+    name: bump and tag
+    needs: [test, msrv]
+    # The bump is itself a push to main, so without the message guard this would trigger itself
+    # for ever. `[skip ci]` would do the same job but would also skip the tests on the bump
+    # commit, and the bumped lockfile is worth testing.
+    if: >-
+      github.event_name == 'push' &&
+      !startsWith(github.event.head_commit.message, 'Release v')
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      contents: write
+    outputs:
+      tag: ${{ steps.bump.outputs.tag }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          # main's tip, not the commit that triggered this run. If a second push arrived while
+          # this one was queued, the bump has to sit on top of what main is now — otherwise both
+          # runs read the same version out of Cargo.toml and race for the same tag.
+          ref: main
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - name: Bump the minor version
+        id: bump
+        run: |
+          set -euo pipefail
+
+          current="$(grep -m1 '^version = ' Cargo.toml | cut -d'"' -f2)"
+          major="${current%%.*}"
+          rest="${current#*.}"
+          minor="${rest%%.*}"
+          next="$major.$((minor + 1)).0"
+
+          # Only the first `version = ` line, which is the one in [package]. Dependency versions
+          # are inline tables, so they never start a line, but the range keeps that true even if
+          # one is reformatted later.
+          sed -i "0,/^version = / s/^version = \".*\"/version = \"$next\"/" Cargo.toml
+          if [ "$(grep -m1 '^version = ' Cargo.toml | cut -d'"' -f2)" != "$next" ]; then
+              echo "Failed to rewrite the version in Cargo.toml" >&2
+              exit 1
+          fi
+
+          # --workspace touches only countercow's own entry in the lockfile. A bare `cargo update`
+          # would take every dependency to its newest compatible release as a side effect of a
+          # version bump, which is how an MSRV floor moves without anyone deciding to move it.
+          cargo update --workspace
+
+          # A tag that already exists means someone tagged out of band; say so here rather than
+          # letting the push fail with git's wording several steps later.
+          if git ls-remote --exit-code --tags origin "refs/tags/v$next" >/dev/null 2>&1; then
+              echo "Tag v$next already exists on the remote" >&2
+              exit 1
+          fi
+
+          echo "tag=v$next" >> "$GITHUB_OUTPUT"
+          echo "Bumping $current -> $next"
+
+      - name: Commit and tag
+        env:
+          TAG: ${{ steps.bump.outputs.tag }}
+        run: |
+          set -euo pipefail
+
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add Cargo.toml Cargo.lock
+          git commit -m "Release $TAG"
+          git tag "$TAG"
+          # --atomic so the branch and the tag land together or not at all. A tag without the
+          # commit that names it would build a release for a version main does not claim.
+          git push --atomic origin HEAD:main "refs/tags/$TAG"
+
+  build:
+    name: ${{ matrix.target }}
+    needs: version
+    # workflow_dispatch has no bump to wait for, so `always()` lets this start with the version
+    # job skipped; the tag then comes from the input rather than from the bump.
+    if: >-
+      always() &&
+      (needs.version.result == 'success' || github.event_name == 'workflow_dispatch')
+    runs-on: ${{ matrix.os }}
+    # The whole job, cold cache and all, has never taken more than 90 seconds once the runner is
+    # native. Anything past two minutes is something wedged rather than something slow, and this
+    # is a terminal dashboard — nothing here is worth an hour of a stuck runner.
+    timeout-minutes: 2
+    permissions:
+      contents: read
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: x86_64-unknown-linux-gnu
+            os: ubuntu-latest
+          # A native arm64 runner rather than cross-compiling. The cross needed a linker from
+          # apt, and that one step took twelve minutes against fifty seconds for this entire job
+          # on x86-64 — long enough to look like a hang. Native removes the step, and makes this
+          # a target the smoke test below can actually execute.
+          - target: aarch64-unknown-linux-gnu
+            os: ubuntu-24.04-arm
+          # macos-latest is arm64, so the Apple Silicon build is native and the Intel one is the
+          # only cross left. It needs no extra tooling: the SDK Xcode ships covers both.
+          - target: x86_64-apple-darwin
+            os: macos-latest
+          - target: aarch64-apple-darwin
+            os: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.version.outputs.tag || inputs.tag }}
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ matrix.target }}
+
+      - name: Build
+        run: cargo build --release --locked --target ${{ matrix.target }}
+
+      # The only point in the pipeline where the thing being shipped is run at all. It catches a
+      # binary that linked but cannot start. Every target except the Intel Mac cross is now
+      # native, so `native` marks only the one runner that cannot execute what it just built.
+      - name: Smoke test
+        if: matrix.target != 'x86_64-apple-darwin'
+        env:
+          TARGET: ${{ matrix.target }}
+        run: |
+          set -euo pipefail
+          "target/$TARGET/release/countercow" --version
+
+      - name: Package
+        env:
+          TAG: ${{ needs.version.outputs.tag || inputs.tag }}
+          TARGET: ${{ matrix.target }}
+          # bsdtar on macOS otherwise stores extended attributes as ._ members, which land in the
+          # tarball as junk files beside the binary.
+          COPYFILE_DISABLE: "1"
+        run: |
+          set -euo pipefail
+
+          version="${TAG#v}"
+          declared="$(grep -m1 '^version = ' Cargo.toml | cut -d'"' -f2)"
+          # A tag that disagrees with Cargo.toml would ship a binary reporting one version inside
+          # a file named for another. Cheap to check, confusing to debug later.
+          if [ "$version" != "$declared" ]; then
+              echo "Tag $TAG does not match the version in Cargo.toml ($declared)" >&2
+              exit 1
+          fi
+
+          # Everything sits under one directory inside the tarball so unpacking in a downloads
+          # folder leaves one thing behind rather than three.
+          name="countercow-$version-$TARGET"
+          mkdir -p "dist/$name"
+          cp "target/$TARGET/release/countercow" "dist/$name/"
+          cp LICENSE README.md "dist/$name/"
+          tar -czf "dist/$name.tar.gz" -C dist "$name"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: tarball-${{ matrix.target }}
+          path: dist/*.tar.gz
+          if-no-files-found: error
+          retention-days: 7
+
+  publish:
+    needs: [version, build]
+    if: always() && needs.build.result == 'success'
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      contents: write
+    steps:
+      # One release built from all four tarballs at once, rather than each build job appending to
+      # it: four jobs racing to create the same release is a known way to get a 422, and the
+      # checksums have to be listed together to be checkable with a single `sha256sum -c`.
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          pattern: tarball-*
+          merge-multiple: true
+
+      - name: Checksums
+        working-directory: dist
+        run: sha256sum *.tar.gz > SHA256SUMS
+
+      - uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ needs.version.outputs.tag || inputs.tag }}
+          generate_release_notes: true
+          # A packaging change that quietly stops producing files should fail the release rather
+          # than publish an empty one.
+          fail_on_unmatched_files: true
+          files: |
+            dist/*.tar.gz
+            dist/SHA256SUMS
