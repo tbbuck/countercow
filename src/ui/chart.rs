@@ -10,6 +10,8 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::Block;
 use ratatui::Frame;
 
+use crate::app::Reading;
+
 use super::gradient::Gradient;
 use super::graph::Graph;
 use super::panels::titled_block;
@@ -32,18 +34,16 @@ pub enum Scale {
 pub struct TimeSeries<'a> {
     pub title: &'a str,
     /// Oldest first. Rendered left to right, newest at the right edge.
-    pub values: &'a [f64],
+    pub values: &'a [Reading],
     pub gradient: Gradient,
     pub scale: Scale,
     /// Formats the scale label and the current-value annotation.
     pub format: fn(f64) -> String,
-    /// Seconds between samples, for the time label.
-    pub interval: f64,
 }
 
 impl TimeSeries<'_> {
     pub fn render(&self, frame: &mut Frame, area: Rect, theme: &Theme) {
-        let latest = self.values.last().copied().unwrap_or(0.0);
+        let latest = self.values.last().map_or(0.0, |reading| reading.value);
         let max = self.full_scale();
         let inner_width = area.width.saturating_sub(2);
 
@@ -66,8 +66,9 @@ impl TimeSeries<'_> {
             return;
         }
 
+        let values: Vec<f64> = self.values.iter().map(|reading| reading.value).collect();
         Graph {
-            values: self.values,
+            values: &values,
             max,
             gradient: self.gradient,
             plot: theme.plot,
@@ -90,14 +91,28 @@ impl TimeSeries<'_> {
     }
 
     /// How far back the drawn trace goes, once it goes back at all.
+    ///
+    /// Measured from the readings themselves rather than from the sample count and the current
+    /// rate. The rate can change while a series is on screen, which would make the arithmetic
+    /// answer confidently wrong about every sample gathered before the change.
     fn span_label(&self, theme: &Theme, inner_width: u16) -> Option<String> {
         let drawn = self.values.len().min(Graph::capacity(theme.plot, inner_width));
-        (drawn >= 2).then(|| format!("-{:.0}s", (drawn - 1) as f64 * self.interval))
+        if drawn < 2 {
+            return None;
+        }
+        let window = &self.values[self.values.len() - drawn..];
+        let span = window.last()?.at.saturating_duration_since(window.first()?.at);
+        Some(format!("-{:.0}s", span.as_secs_f64()))
     }
 
     /// Full-scale value for the plot.
     fn full_scale(&self) -> f64 {
-        let peak = self.values.iter().copied().filter(|v| v.is_finite()).fold(0.0, f64::max);
+        let peak = self
+            .values
+            .iter()
+            .map(|reading| reading.value)
+            .filter(|value| value.is_finite())
+            .fold(0.0, f64::max);
         match self.scale {
             // A little headroom, so the peak sits just below the top rather than jammed into it.
             Scale::Auto if peak > 0.0 => peak * 1.08,
@@ -135,44 +150,78 @@ pub fn bordered(theme: &Theme) -> Block<'static> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::time::{Duration, Instant};
 
-    fn series(values: &[f64], scale: Scale) -> TimeSeries<'_> {
+    /// Readings a second apart, oldest first.
+    fn readings(values: &[f64]) -> Vec<Reading> {
+        let start = Instant::now();
+        values
+            .iter()
+            .enumerate()
+            .map(|(index, &value)| Reading { at: start + Duration::from_secs(index as u64), value })
+            .collect()
+    }
+
+    fn series(values: &[Reading], scale: Scale) -> TimeSeries<'_> {
         TimeSeries {
             title: "Test",
             values,
             gradient: crate::ui::gradient::FLAME,
             scale,
             format: |v| format!("{v:.0}"),
-            interval: 1.0,
         }
     }
 
     #[test]
     fn an_auto_scale_leaves_headroom_above_the_peak() {
-        let scale = series(&[10.0, 40.0, 25.0], Scale::Auto).full_scale();
+        let scale = series(&readings(&[10.0, 40.0, 25.0]), Scale::Auto).full_scale();
         assert!(scale > 40.0 && scale < 45.0, "{scale}");
     }
 
     #[test]
     fn a_flat_zero_series_gets_a_usable_scale_rather_than_zero() {
-        assert_eq!(series(&[0.0, 0.0], Scale::Auto).full_scale(), 1.0);
-        assert_eq!(series(&[], Scale::Auto).full_scale(), 1.0);
+        assert_eq!(series(&readings(&[0.0, 0.0]), Scale::Auto).full_scale(), 1.0);
+        assert_eq!(series(&readings(&[]), Scale::Auto).full_scale(), 1.0);
     }
 
     #[test]
     fn a_fixed_scale_is_held_regardless_of_the_peak() {
         // 3% CPU on a 0-100 scale must not rescale to look like a spike.
-        assert_eq!(series(&[3.0, 2.0, 3.5], Scale::Fixed(100.0)).full_scale(), 100.0);
+        let quiet = readings(&[3.0, 2.0, 3.5]);
+        assert_eq!(series(&quiet, Scale::Fixed(100.0)).full_scale(), 100.0);
     }
 
     #[test]
     fn a_fixed_scale_still_grows_rather_than_clipping_the_trace() {
-        assert_eq!(series(&[10.0, 140.0], Scale::Fixed(100.0)).full_scale(), 140.0);
+        let over = readings(&[10.0, 140.0]);
+        assert_eq!(series(&over, Scale::Fixed(100.0)).full_scale(), 140.0);
     }
 
     #[test]
     fn non_finite_readings_do_not_poison_the_scale() {
-        let scale = series(&[10.0, f64::NAN, 20.0], Scale::Auto).full_scale();
+        let scale = series(&readings(&[10.0, f64::NAN, 20.0]), Scale::Auto).full_scale();
         assert!(scale.is_finite() && scale > 20.0, "{scale}");
+    }
+
+    #[test]
+    fn the_span_is_measured_from_the_readings_not_the_sample_count() {
+        // Ten readings a second apart span nine seconds, whatever rate is in force now.
+        let theme = Theme::default();
+        let ten = readings(&[1.0; 10]);
+        assert_eq!(series(&ten, Scale::Auto).span_label(&theme, 40), Some("-9s".into()));
+    }
+
+    #[test]
+    fn a_span_covers_only_the_readings_that_fit_on_screen() {
+        // Sixty readings into a graph four cells wide: eight fit, so seven seconds are drawn.
+        let theme = Theme::default();
+        let many = readings(&[1.0; 60]);
+        assert_eq!(series(&many, Scale::Auto).span_label(&theme, 4), Some("-7s".into()));
+    }
+
+    #[test]
+    fn a_single_reading_has_no_span_to_report() {
+        let theme = Theme::default();
+        assert_eq!(series(&readings(&[1.0]), Scale::Auto).span_label(&theme, 40), None);
     }
 }

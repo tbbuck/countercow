@@ -4,6 +4,7 @@ use std::time::Instant;
 use clap::{Parser, Subcommand};
 use color_eyre::eyre::{bail, Result};
 
+use countercow::app;
 use countercow::counters;
 use countercow::ipc;
 use countercow::ipc::discovery::{self, DotnetProcess};
@@ -45,20 +46,18 @@ enum Command {
     },
 }
 
-/// Smallest and largest refresh intervals worth asking the runtime for.
+/// The same range `-` and `+` move within, so a rate given here is one the keys can also reach.
 ///
-/// Zero is the one that matters: it is what a typo produces, and the runtime takes it literally —
-/// the session opens, reports nothing, and the dashboard sits there looking attached to a dead
-/// process. The upper bound is judgement rather than a limit.
-const MIN_INTERVAL_SECS: f64 = 0.05;
-const MAX_INTERVAL_SECS: f64 = 60.0;
-
+/// The lower bound matters most: zero is what a typo produces, and the runtime takes it literally
+/// — the session opens, reports nothing, and the dashboard sits there looking attached to a dead
+/// process.
 fn parse_interval(text: &str) -> std::result::Result<f64, String> {
     let seconds: f64 = text.parse().map_err(|_| format!("{text:?} is not a number"))?;
-    if !(MIN_INTERVAL_SECS..=MAX_INTERVAL_SECS).contains(&seconds) {
+    if !(app::MIN_INTERVAL..=app::MAX_INTERVAL).contains(&seconds) {
         return Err(format!(
-            "{seconds} seconds is outside the {MIN_INTERVAL_SECS}–{MAX_INTERVAL_SECS} range \
-             countercow can sample at"
+            "{seconds} seconds is outside the {}–{} range countercow samples at",
+            app::MIN_INTERVAL,
+            app::MAX_INTERVAL
         ));
     }
     Ok(seconds)

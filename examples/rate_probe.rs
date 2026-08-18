@@ -1,31 +1,41 @@
-//! Check that a counter session can be closed and reopened at a different rate.
+//! Check what a counter session actually delivers at a given refresh rate.
 //!
 //! This is what `-` and `+` do in the dashboard, and the part of it no test can reach: the layout
 //! tests never speak to a runtime, and driving the TUI needs a terminal. Here there is no terminal
-//! at all — just the two sessions, back to back, against a live process.
+//! at all — just a session per rate, back to back, against a live process.
 //!
-//! The runtime stamps every counter payload with the interval it is using, so the proof is direct
-//! rather than inferred from arrival times.
+//! The runtime stamps every counter payload with the interval it measured, so the probe reads the
+//! stream directly rather than through [`session::run`], whose interval filter is one of the
+//! things worth measuring.
 //!
 //! ```text
-//! cargo run --example rate_probe -- <pid> [first-secs] [second-secs]
+//! cargo run --example rate_probe -- <pid> [window-secs] [interval...]
 //! ```
 
-use std::ops::ControlFlow;
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::Path;
 use std::time::{Duration, Instant};
 
-use countercow::counters::session;
+use countercow::counters::{sample, session};
 use countercow::ipc::discovery;
+use countercow::nettrace::blocks::NettraceParser;
 
-/// The two rates to sample at: the dashboard default, and the fastest rung `-` reaches.
-const FIRST: f64 = 1.0;
-const SECOND: f64 = 0.25;
+/// Rates to sweep when none are given.
+const DEFAULT_SWEEP: [f64; 6] = [0.25, 0.5, 1.0, 2.0, 3.0, 5.0];
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut args = std::env::args().skip(1);
-    let pid: u32 = args.next().ok_or("usage: rate_probe <pid> [secs] [secs]")?.parse()?;
-    let window = Duration::from_secs_f64(args.next().unwrap_or_else(|| "4".into()).parse()?);
+    let pid: u32 =
+        args.next().ok_or("usage: rate_probe <pid> [window-secs] [interval...]")?.parse()?;
+    let window = Duration::from_secs_f64(args.next().unwrap_or_else(|| "6".into()).parse()?);
+
+    let mut intervals: Vec<f64> = Vec::new();
+    for arg in args {
+        intervals.push(arg.parse()?);
+    }
+    if intervals.is_empty() {
+        intervals.extend(DEFAULT_SWEEP);
+    }
 
     let found = discovery::discover()?;
     let process = found
@@ -34,62 +44,97 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         .find(|p| p.pid == pid)
         .ok_or_else(|| format!("no attachable .NET process with pid {pid}"))?;
 
-    let first = sample_at(&process.socket, FIRST, window)?;
-    let second = sample_at(&process.socket, SECOND, window)?;
+    let mut failures = Vec::new();
+    for &interval in &intervals {
+        let run = sample_at(&process.socket, interval, window)?;
+        run.report(interval);
 
-    report("first session", FIRST, &first, window);
-    report("second session", SECOND, &second, window);
-
-    if first.samples == 0 || second.samples == 0 {
-        return Err("a session yielded nothing; the restart cannot be judged".into());
-    }
-    // The runtime's own stamp is the assertion: it says what rate it accepted, so a session that
-    // silently kept the old cadence fails here rather than looking like a success.
-    if (second.reported_interval - SECOND).abs() > SECOND * 0.5 {
-        return Err(format!(
-            "second session reported a {:.3}s interval, not {SECOND}s — the rate did not change",
-            second.reported_interval
-        )
-        .into());
+        if run.kept == 0 {
+            failures.push(format!("{interval}s delivered nothing the dashboard would accept"));
+        } else if run.dropped > 0 {
+            failures.push(format!(
+                "{interval}s had {} of {} payloads filtered out",
+                run.dropped,
+                run.kept + run.dropped
+            ));
+        }
     }
 
-    println!("\nOK: the session closed and reopened at the new rate.");
+    if !failures.is_empty() {
+        return Err(failures.join("; ").into());
+    }
+    println!("\nOK: every rate opened, delivered, and closed.");
     Ok(())
 }
 
+#[derive(Default)]
 struct Run {
-    samples: usize,
-    /// The interval the runtime says it is using, averaged over the payloads it sent.
-    reported_interval: f64,
+    /// Payloads the dashboard's interval filter would accept.
+    kept: usize,
+    /// Payloads it would throw away.
+    dropped: usize,
+    /// Distinct counters seen, however they were stamped.
+    counters: BTreeSet<String>,
+    /// How many payloads carried each stamped interval, to the nearest 10 ms.
+    stamps: BTreeMap<u64, usize>,
+}
+
+impl Run {
+    fn report(&self, asked: f64) {
+        let spread: Vec<String> = self
+            .stamps
+            .iter()
+            .map(|(ms, count)| format!("{:.2}s x{count}", *ms as f64 / 1000.0))
+            .collect();
+        println!(
+            "asked {asked:>5}s | kept {:>5} | dropped {:>5} | {:>3} counters | stamped {}",
+            self.kept,
+            self.dropped,
+            self.counters.len(),
+            spread.join(", ")
+        );
+    }
 }
 
 /// Open a counter session, read for `window`, then close it.
-fn sample_at(socket: &Path, interval: f64, window: Duration) -> Result<Run, Box<dyn std::error::Error>> {
+fn sample_at(
+    socket: &Path,
+    interval: f64,
+    window: Duration,
+) -> Result<Run, Box<dyn std::error::Error>> {
     let session = session::start(socket, interval)?;
     let session_id = session.session_id;
     let deadline = Instant::now() + window;
 
-    let mut samples = 0usize;
-    let mut total_interval = 0.0;
-    session::run(session.stream, interval, |sample| {
-        if Instant::now() >= deadline {
-            return ControlFlow::Break(());
+    let mut run = Run::default();
+    let mut parser = NettraceParser::new(session.stream)?;
+
+    'reading: while let Some(batch) = parser.next_events()? {
+        for event in batch {
+            let Some(metadata) = parser.metadata().get(event.metadata_id) else {
+                continue;
+            };
+            let Some(sample) = sample::extract(metadata, &event)? else {
+                continue;
+            };
+            if Instant::now() >= deadline {
+                break 'reading;
+            }
+
+            run.counters.insert(format!("{}/{}", sample.provider, sample.name));
+            *run.stamps.entry((sample.interval_sec * 100.0).round() as u64 * 10).or_default() += 1;
+
+            // The rule the dashboard applies, evaluated here so its cost shows up in the output
+            // rather than silently shrinking the sample count.
+            if sample.interval_sec > 0.0 && (sample.interval_sec - interval).abs() > interval * 0.5
+            {
+                run.dropped += 1;
+            } else {
+                run.kept += 1;
+            }
         }
-        samples += 1;
-        total_interval += sample.interval_sec;
-        ControlFlow::Continue(())
-    })?;
+    }
     session::stop(socket, session_id)?;
 
-    let reported_interval = if samples > 0 { total_interval / samples as f64 } else { 0.0 };
-    Ok(Run { samples, reported_interval })
-}
-
-fn report(label: &str, asked: f64, run: &Run, window: Duration) {
-    println!(
-        "{label:>15}: asked {asked}s, runtime reported {:.3}s, {} samples in {:.0}s",
-        run.reported_interval,
-        run.samples,
-        window.as_secs_f64()
-    );
+    Ok(run)
 }

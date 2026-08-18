@@ -15,11 +15,20 @@ use crate::runtime::state::RuntimeState;
 /// Samples retained per counter. At the default one-second interval this is ten minutes.
 pub const HISTORY_CAPACITY: usize = 600;
 
-/// Refresh rates `-` and `+` step through, fastest first.
+/// How much one press of `-` or `+` moves the refresh rate, and the range it moves within.
 ///
-/// Faster than a quarter second and the counters are mostly measuring the runtime's own timer;
-/// slower than ten seconds and the graphs stop reading as live.
-pub const INTERVALS: [f64; 7] = [0.25, 0.5, 1.0, 2.0, 3.0, 5.0, 10.0];
+/// Faster than 100 ms and the counters are mostly measuring the runtime's own timer; slower than
+/// ten seconds and the graphs stop reading as live. Same range and step as btop's update timer.
+pub const INTERVAL_STEP: f64 = 0.1;
+pub const MIN_INTERVAL: f64 = 0.1;
+pub const MAX_INTERVAL: f64 = 10.0;
+
+/// How long a rate must stand still before the session is reopened at it.
+///
+/// A step is 100 ms, so getting from one second to two is ten presses. Restarting the EventPipe
+/// session on each of them would open and close ten sessions against the target in about as many
+/// frames; waiting for the keypresses to stop collapses that into one.
+const INTERVAL_SETTLE: Duration = Duration::from_millis(400);
 
 /// Default CPU profile window. Long enough for a stable picture at ~13,000 samples/second,
 /// short enough not to feel like a wait.
@@ -89,16 +98,27 @@ pub enum Status {
     Failed(String),
 }
 
+/// One counter reading, and when it arrived.
+///
+/// The arrival time is kept because the refresh rate can change underneath a series: without it
+/// the only way to say how far back a graph reaches is to multiply the sample count by the current
+/// interval, which is wrong for every sample gathered at the previous one.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct Reading {
+    pub at: Instant,
+    pub value: f64,
+}
+
 #[derive(Debug, Clone, Default)]
 pub struct Series {
     pub latest: Option<CounterSample>,
     /// Oldest first.
-    pub history: Vec<f64>,
+    pub history: Vec<Reading>,
 }
 
 impl Series {
-    fn push(&mut self, sample: CounterSample) {
-        self.history.push(sample.value);
+    fn push(&mut self, sample: CounterSample, at: Instant) {
+        self.history.push(Reading { at, value: sample.value });
         if self.history.len() > HISTORY_CAPACITY {
             let overflow = self.history.len() - HISTORY_CAPACITY;
             self.history.drain(..overflow);
@@ -112,8 +132,9 @@ pub struct App {
     pub info: ProcessInfo,
     /// The rate the live session is actually running at.
     pub interval: f64,
-    /// A rate the user has asked for, until the session has been restarted at it.
-    pending_interval: Option<f64>,
+    /// A rate the user has asked for and when they last asked, until the session has been
+    /// restarted at it.
+    pending_interval: Option<(f64, Instant)>,
     series: BTreeMap<CounterKey, Series>,
     providers: BTreeSet<String>,
     pub status: Status,
@@ -178,56 +199,69 @@ impl App {
     /// Record a sample. Pausing freezes the graphs but keeps the session running, so history is
     /// continuous when you unpause rather than showing a misleading gap.
     pub fn record(&mut self, sample: CounterSample) {
+        let now = Instant::now();
         self.status = Status::Live;
         self.samples_seen += 1;
-        self.last_sample_at = Some(Instant::now());
+        self.last_sample_at = Some(now);
         self.providers.insert(sample.provider.clone());
 
         if self.paused {
             return;
         }
         let key = (sample.provider.clone(), sample.name.clone());
-        self.series.entry(key).or_default().push(sample);
+        self.series.entry(key).or_default().push(sample, now);
     }
 
-    /// Step the refresh rate one rung along [`INTERVALS`]. `faster` shortens the interval.
+    /// Move the refresh rate one step. `faster` shortens the interval.
     ///
     /// This only records the request. The rate is fixed when the counter session is created — the
     /// runtime is told it as provider filter data — so applying it means opening a new session,
-    /// which is the event loop's job. Until that succeeds the dashboard keeps reporting the rate
-    /// it is really running at.
+    /// which is the event loop's job once the rate has stopped moving.
     pub fn step_interval(&mut self, faster: bool) {
-        let from = self.pending_interval.unwrap_or(self.interval);
+        let from = self.wanted_interval();
+        let delta = if faster { -INTERVAL_STEP } else { INTERVAL_STEP };
 
-        // The nearest rung in the direction asked for, rather than the nearest rung and then a
-        // step: `--interval` need not be on the ladder, and from 0.1s the nearest rung is 0.25s,
-        // so stepping from it would answer a request to speed up by slowing down.
-        let next = if faster {
-            INTERVALS.iter().rev().find(|&&rung| rung < from)
-        } else {
-            INTERVALS.iter().find(|&&rung| rung > from)
-        };
+        // Rounded back onto the step. A tenth has no exact binary form, so ten unrounded presses
+        // land on 0.9999999999999999, which reaches the runtime as a filter string to match and
+        // the corner of the screen as a rate nobody asked for.
+        let next = (((from + delta) * 10.0).round() / 10.0).clamp(MIN_INTERVAL, MAX_INTERVAL);
 
-        if let Some(&rung) = next {
-            self.pending_interval = Some(rung);
+        // Clamping can land the wrong side of where we started — stepping down from an interval
+        // above the range would otherwise answer a request to slow down by speeding up.
+        if next != from && faster == (next < from) {
+            self.pending_interval = Some((next, Instant::now()));
         }
     }
 
-    /// The rate the session should be restarted at, if the user has asked for one.
+    /// The rate the user has asked for, whether or not the session is running at it yet.
+    pub fn wanted_interval(&self) -> f64 {
+        self.pending_interval.map_or(self.interval, |(interval, _)| interval)
+    }
+
+    /// The rate the session should be restarted at, once the keypresses have stopped.
     pub fn take_pending_interval(&mut self) -> Option<f64> {
-        self.pending_interval.take()
+        self.take_settled_interval(Instant::now())
+    }
+
+    /// [`Self::take_pending_interval`] against a given clock, so the settle window can be tested
+    /// without sleeping through it.
+    fn take_settled_interval(&mut self, now: Instant) -> Option<f64> {
+        let (interval, asked_at) = self.pending_interval?;
+        if now.saturating_duration_since(asked_at) < INTERVAL_SETTLE {
+            return None;
+        }
+        self.pending_interval = None;
+        Some(interval)
     }
 
     /// Adopt a rate the session is now running at.
     ///
-    /// History gathered at the old rate is dropped: the graphs place samples by index, so two
-    /// cadences in one series would silently stretch part of the trace. The latest reading of each
-    /// counter survives, so the number panels stay populated while the graphs refill.
+    /// History is deliberately kept. Every reading carries the moment it arrived, so a graph can
+    /// say exactly how far back it reaches whatever cadence produced it; throwing the history away
+    /// instead would blank every chart on each press, and at a slow rate it then refills one
+    /// sub-column per interval — which is indistinguishable from the display having frozen.
     pub fn apply_interval(&mut self, interval: f64) {
         self.interval = interval;
-        for series in self.series.values_mut() {
-            series.history = series.latest.iter().map(|sample| sample.value).collect();
-        }
     }
 
     pub fn series(&self, provider: &str, name: &str) -> Option<&Series> {
@@ -242,7 +276,7 @@ impl App {
         Some(self.latest(provider, name)?.value)
     }
 
-    pub fn history(&self, provider: &str, name: &str) -> &[f64] {
+    pub fn history(&self, provider: &str, name: &str) -> &[Reading] {
         self.series(provider, name).map_or(&[], |s| &s.history)
     }
 
@@ -440,6 +474,23 @@ mod tests {
         App::new(process, ProcessInfo::default(), 1.0)
     }
 
+    /// An app started at an interval that need not sit on the step, as `--interval` allows.
+    fn app_at(interval: f64) -> App {
+        let process = DotnetProcess {
+            pid: 1,
+            socket: PathBuf::from("/tmp/socket"),
+            name: "Test".into(),
+            command: "test".into(),
+            start_key_verified: true,
+        };
+        App::new(process, ProcessInfo::default(), interval)
+    }
+
+    /// A counter's history as plain numbers.
+    fn values(app: &App, name: &str) -> Vec<f64> {
+        app.history(catalog::SYSTEM_RUNTIME, name).iter().map(|r| r.value).collect()
+    }
+
     fn sample(provider: &str, name: &str, value: f64) -> CounterSample {
         CounterSample {
             provider: provider.into(),
@@ -460,7 +511,7 @@ mod tests {
         for v in [1.0, 2.0, 3.0] {
             app.record(sample(catalog::SYSTEM_RUNTIME, "cpu-usage", v));
         }
-        assert_eq!(app.history(catalog::SYSTEM_RUNTIME, "cpu-usage"), &[1.0, 2.0, 3.0]);
+        assert_eq!(values(&app, "cpu-usage"), vec![1.0, 2.0, 3.0]);
         assert_eq!(app.value(catalog::SYSTEM_RUNTIME, "cpu-usage"), Some(3.0));
         assert_eq!(app.status, Status::Live);
     }
@@ -471,7 +522,7 @@ mod tests {
         for i in 0..HISTORY_CAPACITY + 50 {
             app.record(sample(catalog::SYSTEM_RUNTIME, "cpu-usage", i as f64));
         }
-        let history = app.history(catalog::SYSTEM_RUNTIME, "cpu-usage");
+        let history = values(&app, "cpu-usage");
         assert_eq!(history.len(), HISTORY_CAPACITY);
         assert_eq!(history[0], 50.0, "oldest samples are discarded");
         assert_eq!(history[history.len() - 1], (HISTORY_CAPACITY + 49) as f64);
@@ -496,7 +547,7 @@ mod tests {
         app.paused = true;
         app.record(sample(catalog::SYSTEM_RUNTIME, "cpu-usage", 2.0));
 
-        assert_eq!(app.history(catalog::SYSTEM_RUNTIME, "cpu-usage"), &[1.0]);
+        assert_eq!(values(&app, "cpu-usage"), vec![1.0]);
         assert_eq!(app.samples_seen, 2, "still counting arrivals");
         assert!(app.last_sample_at.is_some());
     }
@@ -526,102 +577,97 @@ mod tests {
     }
 
     #[test]
-    fn the_rate_steps_along_the_ladder_in_both_directions() {
+    fn the_rate_steps_by_a_tenth_of_a_second_each_way() {
         let mut faster = app();
         assert_eq!(faster.interval, 1.0);
+
         faster.step_interval(true);
-        assert_eq!(faster.take_pending_interval(), Some(0.5), "- is faster");
+        assert_eq!(faster.wanted_interval(), 0.9, "- is faster");
 
         let mut slower = app();
         slower.step_interval(false);
-        assert_eq!(slower.take_pending_interval(), Some(2.0), "+ is slower");
+        assert_eq!(slower.wanted_interval(), 1.1, "+ is slower");
     }
 
     #[test]
-    fn repeated_presses_step_from_the_pending_rate_not_the_live_one() {
+    fn repeated_presses_step_from_the_wanted_rate_not_the_live_one() {
         let mut app = app();
-        app.step_interval(false);
-        app.step_interval(false);
-        assert_eq!(app.take_pending_interval(), Some(3.0), "two rungs, not one");
-    }
-
-    #[test]
-    fn the_ladder_stops_at_both_ends_without_asking_for_a_restart() {
-        let mut app = app();
-        // Step the way the event loop does: ask, then adopt what the new session runs at.
-        for _ in 0..10 {
+        for _ in 0..5 {
             app.step_interval(true);
-            if let Some(interval) = app.take_pending_interval() {
-                app.apply_interval(interval);
-            }
         }
-        assert_eq!(app.interval, INTERVALS[0]);
-
-        // Already at the fastest rung: nothing to apply, so no session churn.
-        app.step_interval(true);
-        assert_eq!(app.take_pending_interval(), None);
+        assert_eq!(app.wanted_interval(), 0.5, "five steps below one second");
+        assert_eq!(app.interval, 1.0, "the session has not been restarted yet");
     }
 
     #[test]
-    fn a_rate_that_could_not_be_applied_leaves_the_next_step_where_it_was() {
-        // The event loop drops the request when the session will not restart, so the next press
-        // must step from the rate that is really running rather than from the one that failed.
+    fn stepping_never_drifts_off_the_tenth() {
+        // A tenth is not exact in binary, so ten unrounded presses would land just short of one.
         let mut app = app();
-        app.step_interval(true);
-        assert_eq!(app.take_pending_interval(), Some(0.5));
-
-        app.step_interval(true);
-        assert_eq!(app.take_pending_interval(), Some(0.5), "still one rung below 1s");
-    }
-
-    /// An app started at an interval that is not on the ladder, as `--interval` allows.
-    fn app_at(interval: f64) -> App {
-        let process = DotnetProcess {
-            pid: 1,
-            socket: PathBuf::from("/tmp/socket"),
-            name: "Test".into(),
-            command: "test".into(),
-            start_key_verified: true,
-        };
-        App::new(process, ProcessInfo::default(), interval)
+        for _ in 0..9 {
+            app.step_interval(true);
+        }
+        assert_eq!(app.wanted_interval(), MIN_INTERVAL);
+        for _ in 0..9 {
+            app.step_interval(false);
+        }
+        assert_eq!(app.wanted_interval(), 1.0, "back exactly where it started");
     }
 
     #[test]
-    fn an_off_ladder_interval_steps_to_the_next_rung_along() {
-        // 0.7 sits between rungs, so a step should reach the neighbouring one, not 0.7 ± a rung.
-        let mut slower = app_at(0.7);
-        slower.step_interval(false);
-        assert_eq!(slower.take_pending_interval(), Some(1.0));
+    fn the_range_stops_at_both_ends_without_asking_for_a_restart() {
+        let mut fastest = app_at(MIN_INTERVAL);
+        fastest.step_interval(true);
+        assert_eq!(fastest.take_pending_interval(), None, "already at the fastest rate");
 
-        let mut faster = app_at(0.7);
-        faster.step_interval(true);
-        assert_eq!(faster.take_pending_interval(), Some(0.5));
+        let mut slowest = app_at(MAX_INTERVAL);
+        slowest.step_interval(false);
+        assert_eq!(slowest.take_pending_interval(), None, "already at the slowest rate");
     }
 
     #[test]
     fn stepping_always_moves_in_the_direction_asked_for() {
-        // From below the fastest rung, the nearest rung is a *slower* one. Speeding up from there
-        // must do nothing rather than obey the nearest rung and slow the dashboard down.
-        let mut app = app_at(0.1);
-        app.step_interval(true);
-        assert_eq!(app.take_pending_interval(), None, "already faster than the ladder");
-
-        app.step_interval(false);
-        assert_eq!(app.take_pending_interval(), Some(0.25));
+        // From outside the range, clamping alone would answer "slower" by speeding up.
+        let mut above = app_at(30.0);
+        above.step_interval(false);
+        assert_eq!(above.wanted_interval(), 30.0, "nothing slower to reach");
+        above.step_interval(true);
+        assert_eq!(above.wanted_interval(), MAX_INTERVAL, "and back into range");
     }
 
     #[test]
-    fn an_interval_beyond_the_slowest_rung_can_still_be_sped_up() {
-        let mut app = app_at(120.0);
+    fn an_off_step_interval_snaps_onto_the_step() {
+        let mut app = app_at(0.73);
         app.step_interval(false);
-        assert_eq!(app.take_pending_interval(), None, "already slower than the ladder");
-
-        app.step_interval(true);
-        assert_eq!(app.take_pending_interval(), Some(10.0));
+        assert_eq!(app.wanted_interval(), 0.8);
     }
 
     #[test]
-    fn applying_a_rate_clears_history_but_keeps_the_current_readings() {
+    fn a_rate_is_not_applied_until_the_keypresses_stop() {
+        // Ten presses to get from one second to two would otherwise open ten sessions.
+        let mut app = app();
+        app.step_interval(true);
+        assert_eq!(app.take_pending_interval(), None, "still being pressed");
+
+        let settled = Instant::now() + INTERVAL_SETTLE;
+        assert_eq!(app.take_settled_interval(settled), Some(0.9));
+        assert_eq!(app.take_settled_interval(settled), None, "taken only once");
+    }
+
+    #[test]
+    fn a_further_press_restarts_the_settle_window() {
+        let mut app = app();
+        app.step_interval(true);
+        let nearly = Instant::now() + INTERVAL_SETTLE - Duration::from_millis(1);
+        app.step_interval(true);
+
+        assert_eq!(app.take_settled_interval(nearly), None, "the second press reset the wait");
+        assert_eq!(app.wanted_interval(), 0.8);
+    }
+
+    #[test]
+    fn applying_a_rate_keeps_the_history_gathered_at_the_old_one() {
+        // Clearing it would blank every chart on each press, and at a slow rate the refill is
+        // slow enough to be indistinguishable from the display having stopped.
         let mut app = app();
         for v in [1.0, 2.0, 3.0] {
             app.record(sample(catalog::SYSTEM_RUNTIME, "cpu-usage", v));
@@ -629,19 +675,17 @@ mod tests {
 
         app.apply_interval(0.5);
         assert_eq!(app.interval, 0.5);
-        assert_eq!(
-            app.history(catalog::SYSTEM_RUNTIME, "cpu-usage"),
-            &[3.0],
-            "history at the old cadence is dropped, the latest reading is not"
-        );
-        assert_eq!(app.value(catalog::SYSTEM_RUNTIME, "cpu-usage"), Some(3.0));
+        assert_eq!(values(&app, "cpu-usage"), vec![1.0, 2.0, 3.0]);
     }
 
     #[test]
-    fn a_rate_is_not_adopted_until_it_is_applied() {
+    fn readings_are_stamped_with_their_arrival() {
         let mut app = app();
-        app.step_interval(true);
-        assert_eq!(app.interval, 1.0, "the dashboard reports the live rate, not the wanted one");
+        app.record(sample(catalog::SYSTEM_RUNTIME, "cpu-usage", 1.0));
+        app.record(sample(catalog::SYSTEM_RUNTIME, "cpu-usage", 2.0));
+
+        let history = app.history(catalog::SYSTEM_RUNTIME, "cpu-usage");
+        assert!(history[1].at >= history[0].at, "arrival order is recorded, not assumed");
     }
 
     #[test]

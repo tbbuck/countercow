@@ -6,7 +6,7 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::{Clear, Paragraph};
 use ratatui::Frame;
 
-use crate::app::{format_uptime, App, Status};
+use crate::app::{format_uptime, App, Reading, Status};
 use crate::counters::catalog;
 
 use super::chart::{self, Scale, TimeSeries};
@@ -59,7 +59,7 @@ fn render_header(frame: &mut Frame, area: Rect, app: &App, theme: &Theme) {
     let block = chart::bordered(theme).title_top(
         Line::from(vec![
             Span::from(" -/+ ").fg(theme.dim),
-            Span::from(format_interval(app.interval)).fg(theme.accent).bold(),
+            Span::from(format_interval(app.wanted_interval())).fg(theme.accent).bold(),
             Span::from(" "),
         ])
         .right_aligned(),
@@ -228,7 +228,6 @@ fn render_aspnet_body(frame: &mut Frame, area: Rect, app: &App, theme: &Theme) {
             gradient: theme.rate,
             scale: Scale::Auto,
             format: |v| format!("{v:.0}/s"),
-            interval: app.interval,
         }
         .render(frame, rps_area, theme);
     }
@@ -282,7 +281,6 @@ fn render_runtime_section(
             // not rescale into a chart that looks like it is on fire.
             scale: Scale::Fixed(100.0),
             format: |v| format!("{v:.1}%"),
-            interval: app.interval,
         }
         .render(frame, cpu_chart_area, theme);
     }
@@ -320,7 +318,10 @@ fn render_bytes_chart(
         .latest(catalog::SYSTEM_RUNTIME, counter)
         .and_then(catalog::byte_scale)
         .unwrap_or(1.0);
-    let scaled: Vec<f64> = history.iter().map(|v| v * scale).collect();
+    let scaled: Vec<Reading> = history
+        .iter()
+        .map(|reading| Reading { value: reading.value * scale, ..*reading })
+        .collect();
 
     TimeSeries {
         title,
@@ -328,7 +329,6 @@ fn render_bytes_chart(
         gradient: theme.heap,
         scale: Scale::Auto,
         format: catalog::format_bytes,
-        interval: app.interval,
     }
     .render(frame, area, theme);
 }
@@ -342,7 +342,7 @@ fn render_help(frame: &mut Frame, area: Rect, theme: &Theme) {
         Line::from("  i         investigate: allocations, GC causes, exceptions"),
         Line::from("  c         cpu profile: which methods are burning time"),
         Line::from("  p         pause history (session keeps running)"),
-        Line::from("  - / +     refresh faster / slower"),
+        Line::from("  - / +     refresh 100ms faster / slower"),
         Line::from("  m         cycle braille / block / octant plotting"),
         Line::from("  ?         toggle this help"),
         Line::from(""),

@@ -47,7 +47,7 @@ countercow ps              # list attachable processes and exit
 | `i` | investigate: allocations, GC causes, exceptions, contention |
 | `c` | CPU profile: which methods are burning time |
 | `p` | pause history (the session keeps running) |
-| `-` / `+` | refresh faster / slower |
+| `-` / `+` | refresh 100 ms faster / slower |
 | `m` | cycle braille / block / octant plotting |
 | `?` | help |
 
@@ -58,15 +58,18 @@ Counters start flowing the moment you attach — the session opens before the fi
 nothing needs starting by hand. (Investigating and profiling are the exceptions, and deliberately
 so: both cost the target real CPU, so they run only while you are looking at them.)
 
-Counters refresh **once a second** by default. `-` and `+` step that between 0.25s and 10s, and
-the rate in force is always shown in the top right corner — the graphs place samples by index, so
-their time axis means nothing without it. `--interval` sets where it starts.
+Counters refresh **once a second** by default. `-` and `+` move that by 100 ms at a time between
+0.1s and 10s, the same step and range as btop's update timer, and the rate in force is always shown
+in the top right corner. `--interval` sets where it starts.
 
 The runtime is told the rate when the counter session opens and there is no way to change it in
-place, so each step closes that session and opens another. History gathered at the old rate is
-dropped rather than spliced onto the new: two cadences in one series would silently stretch part
-of the trace. The latest reading of each counter survives, so the number panels stay populated
-while the graphs refill.
+place, so a change means closing that session and opening another. Because a step is only 100 ms,
+the change is applied once the keypresses stop rather than on each one — otherwise getting from one
+second to two would open ten sessions against the target in about as many frames.
+
+History is kept across the change. Every reading is stamped with the moment it arrived, so a graph
+reports how far back it reaches from the readings themselves rather than by multiplying its sample
+count by the current rate — which would be wrong for everything gathered before the change.
 
 ## Investigating
 

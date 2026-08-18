@@ -637,12 +637,13 @@ mod tests {
 
     #[test]
     fn minus_asks_for_a_faster_rate_and_plus_a_slower_one() {
+        // The wanted rate, not the applied one: applying waits for the keypresses to settle.
         let mut app = app();
         handle_key(&mut app, &mut Theme::default(), press(KeyCode::Char('-')));
-        assert_eq!(app.take_pending_interval(), Some(0.5));
+        assert_eq!(app.wanted_interval(), 0.9);
 
         handle_key(&mut app, &mut Theme::default(), press(KeyCode::Char('+')));
-        assert_eq!(app.take_pending_interval(), Some(2.0));
+        assert_eq!(app.wanted_interval(), 1.0);
     }
 
     #[test]
@@ -650,10 +651,10 @@ mod tests {
         // Whether the key reports `+` or `=` depends on the shift key, and both should step.
         let mut app = app();
         handle_key(&mut app, &mut Theme::default(), press(KeyCode::Char('=')));
-        assert_eq!(app.take_pending_interval(), Some(2.0));
+        assert_eq!(app.wanted_interval(), 1.1);
 
         handle_key(&mut app, &mut Theme::default(), press(KeyCode::Char('_')));
-        assert_eq!(app.take_pending_interval(), Some(0.5));
+        assert_eq!(app.wanted_interval(), 1.0);
     }
 
     #[test]
@@ -662,7 +663,7 @@ mod tests {
         let mut app = app();
         app.toggle_investigate();
         handle_key(&mut app, &mut Theme::default(), press(KeyCode::Char('-')));
-        assert_eq!(app.take_pending_interval(), None);
+        assert_eq!(app.wanted_interval(), 1.0, "unchanged");
     }
 
     #[test]
