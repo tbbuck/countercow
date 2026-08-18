@@ -15,6 +15,12 @@ use crate::runtime::state::RuntimeState;
 /// Samples retained per counter. At the default one-second interval this is ten minutes.
 pub const HISTORY_CAPACITY: usize = 600;
 
+/// Refresh rates `-` and `+` step through, fastest first.
+///
+/// Faster than a quarter second and the counters are mostly measuring the runtime's own timer;
+/// slower than ten seconds and the graphs stop reading as live.
+pub const INTERVALS: [f64; 7] = [0.25, 0.5, 1.0, 2.0, 3.0, 5.0, 10.0];
+
 /// Default CPU profile window. Long enough for a stable picture at ~13,000 samples/second,
 /// short enough not to feel like a wait.
 pub const DEFAULT_PROFILE_SECONDS: u64 = 5;
@@ -104,7 +110,10 @@ impl Series {
 pub struct App {
     pub process: DotnetProcess,
     pub info: ProcessInfo,
+    /// The rate the live session is actually running at.
     pub interval: f64,
+    /// A rate the user has asked for, until the session has been restarted at it.
+    pending_interval: Option<f64>,
     series: BTreeMap<CounterKey, Series>,
     providers: BTreeSet<String>,
     pub status: Status,
@@ -143,6 +152,7 @@ impl App {
             process,
             info,
             interval,
+            pending_interval: None,
             series: BTreeMap::new(),
             providers: BTreeSet::new(),
             status: Status::Connecting,
@@ -178,6 +188,45 @@ impl App {
         }
         let key = (sample.provider.clone(), sample.name.clone());
         self.series.entry(key).or_default().push(sample);
+    }
+
+    /// Step the refresh rate one rung along [`INTERVALS`]. `faster` shortens the interval.
+    ///
+    /// This only records the request. The rate is fixed when the counter session is created — the
+    /// runtime is told it as provider filter data — so applying it means opening a new session,
+    /// which is the event loop's job. Until that succeeds the dashboard keeps reporting the rate
+    /// it is really running at.
+    pub fn step_interval(&mut self, faster: bool) {
+        let from = self.pending_interval.unwrap_or(self.interval);
+        let current = nearest_interval(from);
+        let next = if faster {
+            current.saturating_sub(1)
+        } else {
+            (current + 1).min(INTERVALS.len() - 1)
+        };
+
+        // An interval given on the command line need not be on the ladder, so snapping it to the
+        // nearest rung counts as a change; landing back on the rate we already have does not.
+        if INTERVALS[next] != from {
+            self.pending_interval = Some(INTERVALS[next]);
+        }
+    }
+
+    /// The rate the session should be restarted at, if the user has asked for one.
+    pub fn take_pending_interval(&mut self) -> Option<f64> {
+        self.pending_interval.take()
+    }
+
+    /// Adopt a rate the session is now running at.
+    ///
+    /// History gathered at the old rate is dropped: the graphs place samples by index, so two
+    /// cadences in one series would silently stretch part of the trace. The latest reading of each
+    /// counter survives, so the number panels stay populated while the graphs refill.
+    pub fn apply_interval(&mut self, interval: f64) {
+        self.interval = interval;
+        for series in self.series.values_mut() {
+            series.history = series.latest.iter().map(|sample| sample.value).collect();
+        }
     }
 
     pub fn series(&self, provider: &str, name: &str) -> Option<&Series> {
@@ -360,6 +409,16 @@ impl App {
     }
 }
 
+/// The rung of [`INTERVALS`] closest to `interval`.
+fn nearest_interval(interval: f64) -> usize {
+    INTERVALS
+        .iter()
+        .enumerate()
+        .min_by(|(_, a), (_, b)| (*a - interval).abs().total_cmp(&(*b - interval).abs()))
+        .map(|(index, _)| index)
+        .unwrap_or(0)
+}
+
 /// Format a duration as the header shows it.
 pub fn format_uptime(duration: Duration) -> String {
     let total = duration.as_secs();
@@ -473,6 +532,94 @@ mod tests {
         let app = app();
         assert_eq!(app.display(catalog::SYSTEM_RUNTIME, "cpu-usage"), "—");
         assert!(app.history(catalog::SYSTEM_RUNTIME, "cpu-usage").is_empty());
+    }
+
+    #[test]
+    fn the_rate_steps_along_the_ladder_in_both_directions() {
+        let mut faster = app();
+        assert_eq!(faster.interval, 1.0);
+        faster.step_interval(true);
+        assert_eq!(faster.take_pending_interval(), Some(0.5), "- is faster");
+
+        let mut slower = app();
+        slower.step_interval(false);
+        assert_eq!(slower.take_pending_interval(), Some(2.0), "+ is slower");
+    }
+
+    #[test]
+    fn repeated_presses_step_from_the_pending_rate_not_the_live_one() {
+        let mut app = app();
+        app.step_interval(false);
+        app.step_interval(false);
+        assert_eq!(app.take_pending_interval(), Some(3.0), "two rungs, not one");
+    }
+
+    #[test]
+    fn the_ladder_stops_at_both_ends_without_asking_for_a_restart() {
+        let mut app = app();
+        // Step the way the event loop does: ask, then adopt what the new session runs at.
+        for _ in 0..10 {
+            app.step_interval(true);
+            if let Some(interval) = app.take_pending_interval() {
+                app.apply_interval(interval);
+            }
+        }
+        assert_eq!(app.interval, INTERVALS[0]);
+
+        // Already at the fastest rung: nothing to apply, so no session churn.
+        app.step_interval(true);
+        assert_eq!(app.take_pending_interval(), None);
+    }
+
+    #[test]
+    fn a_rate_that_could_not_be_applied_leaves_the_next_step_where_it_was() {
+        // The event loop drops the request when the session will not restart, so the next press
+        // must step from the rate that is really running rather than from the one that failed.
+        let mut app = app();
+        app.step_interval(true);
+        assert_eq!(app.take_pending_interval(), Some(0.5));
+
+        app.step_interval(true);
+        assert_eq!(app.take_pending_interval(), Some(0.5), "still one rung below 1s");
+    }
+
+    #[test]
+    fn an_off_ladder_interval_snaps_to_the_nearest_rung() {
+        let process = DotnetProcess {
+            pid: 1,
+            socket: PathBuf::from("/tmp/socket"),
+            name: "Test".into(),
+            command: "test".into(),
+            start_key_verified: true,
+        };
+        // --interval 0.7 sits between rungs; stepping slower should reach 1.0, not 1.4.
+        let mut app = App::new(process, ProcessInfo::default(), 0.7);
+        app.step_interval(false);
+        assert_eq!(app.take_pending_interval(), Some(1.0));
+    }
+
+    #[test]
+    fn applying_a_rate_clears_history_but_keeps_the_current_readings() {
+        let mut app = app();
+        for v in [1.0, 2.0, 3.0] {
+            app.record(sample(catalog::SYSTEM_RUNTIME, "cpu-usage", v));
+        }
+
+        app.apply_interval(0.5);
+        assert_eq!(app.interval, 0.5);
+        assert_eq!(
+            app.history(catalog::SYSTEM_RUNTIME, "cpu-usage"),
+            &[3.0],
+            "history at the old cadence is dropped, the latest reading is not"
+        );
+        assert_eq!(app.value(catalog::SYSTEM_RUNTIME, "cpu-usage"), Some(3.0));
+    }
+
+    #[test]
+    fn a_rate_is_not_adopted_until_it_is_applied() {
+        let mut app = app();
+        app.step_interval(true);
+        assert_eq!(app.interval, 1.0, "the dashboard reports the live rate, not the wanted one");
     }
 
     #[test]
