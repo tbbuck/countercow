@@ -72,6 +72,15 @@ place, so a change means closing that session and opening another. Because a ste
 the change is applied once the keypresses stop rather than on each one — otherwise getting from one
 second to two would open ten sessions against the target in about as many frames.
 
+The rate is a request, not an instruction, and one you may not win. An EventSource polls its
+counters on a single timer shared by every session watching it, so if anything else is already
+watching — another countercow, `dotnet-counters`, or a session leaked by one of them that was
+killed rather than closed — that tool's rate is the one the provider uses, for both of you. It is
+per provider, so half the dashboard can be on your rate and half on someone else's. countercow
+plots whatever arrives at whatever cadence it arrives, because every reading carries the moment it
+was recorded; `cargo run --example rate_probe -- <pid>` reports the cadence each provider is
+actually publishing at, which is the way to tell.
+
 History is kept across the change. Every reading is stamped with the moment it arrived, so a graph
 reports how far back it reaches from the readings themselves rather than by multiplying its sample
 count by the current rate — which would be wrong for everything gathered before the change.

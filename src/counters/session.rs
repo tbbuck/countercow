@@ -107,11 +107,15 @@ pub fn stop(socket: &Path, session_id: u64) -> Result<(), SessionError> {
 
 /// Parse a session's stream, reporting counter samples until the callback breaks, the process
 /// exits, or the session is stopped from elsewhere.
-pub fn run<F>(
-    stream: impl std::io::Read,
-    interval_secs: f64,
-    mut on_sample: F,
-) -> Result<(), SessionError>
+///
+/// Every payload is reported, including any stamped with an interval other than the one this
+/// session asked for. That is not a foreign session's data leaking in: an EventSource polls its
+/// counters on one timer shared by every session watching it, so a second tool asking for a
+/// quarter of a second pins the source there and *everyone* receives quarter-second payloads.
+/// Filtering those out discarded every reading from the pinned providers and left their panels
+/// looking as though the counters did not exist. Each reading is stamped with its arrival time
+/// when it is recorded, so a cadence that is not the one we asked for plots correctly anyway.
+pub fn run<F>(stream: impl std::io::Read, mut on_sample: F) -> Result<(), SessionError>
 where
     F: FnMut(CounterSample) -> ControlFlow<()>,
 {
@@ -132,10 +136,6 @@ where
             let Some(sample) = sample::extract(metadata, &event)? else {
                 continue;
             };
-
-            if !ours(sample.interval_sec, interval_secs) {
-                continue;
-            }
 
             if on_sample(sample).is_break() {
                 return Ok(());
@@ -162,34 +162,60 @@ fn ours(reported_interval: f64, requested: f64) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::counters::sample::CounterSample;
+    use crate::nettrace::blocks::NettraceParser;
 
-    #[test]
-    fn a_payload_at_the_rate_we_asked_for_is_ours() {
-        assert!(ours(1.0, 1.0));
-        assert!(ours(0.25, 0.25));
+    /// A capture from a loaded ASP.NET app, carrying several providers at once.
+    const LOADED: &[u8] = include_bytes!("../../tests/fixtures/aspnet-net10-loaded.nettrace");
+
+    /// Every counter payload in a stream, decoded without going through [`run`].
+    fn decoded_directly(stream: &[u8]) -> Vec<CounterSample> {
+        let mut parser = NettraceParser::new(std::io::Cursor::new(stream)).expect("parses");
+        let mut samples = Vec::new();
+        while let Some(batch) = parser.next_events().expect("parses") {
+            for event in batch {
+                let Some(metadata) = parser.metadata().get(event.metadata_id) else {
+                    continue;
+                };
+                if let Some(sample) = sample::extract(metadata, &event).expect("decodes") {
+                    samples.push(sample);
+                }
+            }
+        }
+        samples
     }
 
     #[test]
-    fn a_late_payload_is_still_ours() {
-        // The runtime reports what it measured, and a busy process reports late. Dropping these
-        // is what leaves a counter looking as though it does not exist.
-        assert!(ours(1.4, 1.0));
-        assert!(ours(3.0, 1.0), "even a badly delayed one");
+    fn run_reports_every_payload_the_stream_carries() {
+        // An EventSource polls its counters on one timer shared by every session watching it, so
+        // a second tool asking for a quarter of a second pins the source there and we receive
+        // quarter-second payloads however politely we asked for one second. Dropping those on the
+        // floor emptied whole panels, so `run` filters nothing and this is what says so.
+        let expected = decoded_directly(LOADED);
+        assert!(!expected.is_empty(), "the fixture should carry counters");
+
+        let mut reported = Vec::new();
+        run(std::io::Cursor::new(LOADED), |sample| {
+            reported.push(sample);
+            ControlFlow::Continue(())
+        })
+        .expect("the capture parses");
+
+        assert_eq!(reported.len(), expected.len(), "run must not drop payloads");
+        let providers: std::collections::BTreeSet<&str> =
+            reported.iter().map(|s| s.provider.as_str()).collect();
+        assert!(providers.len() > 1, "the fixture should cover several providers: {providers:?}");
     }
 
     #[test]
-    fn a_faster_cadence_belongs_to_someone_else() {
-        // A second tool watching at 0.25s while we asked for 1s would otherwise deliver four
-        // times our sample rate into our history.
-        assert!(!ours(0.25, 1.0));
-        assert!(!ours(0.5, 1.0));
-    }
-
-    #[test]
-    fn an_unstamped_payload_is_kept() {
-        // The first payload of a session carries no interval; rejecting it would drop a counter's
-        // opening reading for no reason.
-        assert!(ours(0.0, 1.0));
+    fn a_callback_that_breaks_stops_the_stream() {
+        let mut seen = 0usize;
+        run(std::io::Cursor::new(LOADED), |_| {
+            seen += 1;
+            ControlFlow::Break(())
+        })
+        .expect("the capture parses");
+        assert_eq!(seen, 1, "breaking on the first payload should read no further");
     }
 
     #[test]

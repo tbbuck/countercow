@@ -206,13 +206,12 @@ fn spawn_input_reader(tx: Sender<AppEvent>, stop: Arc<AtomicBool>) {
 
 fn spawn_session_reader(
     stream: std::os::unix::net::UnixStream,
-    interval: f64,
     tx: Sender<AppEvent>,
     stop: Arc<AtomicBool>,
 ) {
     std::thread::spawn(move || {
         let sender = tx.clone();
-        let result = session::run(stream, interval, |sample| {
+        let result = session::run(stream, |sample| {
             if stop.load(Ordering::Relaxed) || sender.send(AppEvent::Sample(Box::new(sample))).is_err()
             {
                 return ControlFlow::Break(());
@@ -250,7 +249,7 @@ impl Session {
 fn start_counters(socket: &std::path::Path, interval: f64, tx: &Sender<AppEvent>) -> Result<Session> {
     let session = session::start(socket, interval)?;
     let stop = Arc::new(AtomicBool::new(false));
-    spawn_session_reader(session.stream, interval, tx.clone(), Arc::clone(&stop));
+    spawn_session_reader(session.stream, tx.clone(), Arc::clone(&stop));
     Ok(Session { session_id: session.session_id, stop })
 }
 

@@ -101,7 +101,7 @@ fn dump_counters(process: &DotnetProcess, seconds: u64, interval: f64) -> Result
     let session = counters::session::start(&process.socket, interval)?;
     let session_id = session.session_id;
 
-    counters::session::run(session.stream, interval, |sample| {
+    counters::session::run(session.stream, |sample| {
         if Instant::now() >= deadline {
             return ControlFlow::Break(());
         }
