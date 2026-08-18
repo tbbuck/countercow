@@ -27,6 +27,11 @@ is what the runtime reported, and the newest reading is always at the right edge
 counter with a real ceiling, so it holds a fixed 0–100% scale — a process ticking over at 7% looks
 like a process ticking over at 7%, not like one on fire.
 
+Beside the heap trend is a timeline of collections, stacked and coloured by generation to match
+the bars below it. The counters behind it are rates, which on anything but a busy process read
+zero and look broken; as a timeline a quiet process is visibly quiet rather than apparently dead,
+and a gen 2 collection is a mark you can point at.
+
 The layout adapts to the process: this is an ASP.NET Core app, so it gets request and Kestrel
 panels. See [What it shows](#what-it-shows).
 

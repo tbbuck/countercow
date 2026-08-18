@@ -19,6 +19,13 @@ pub const NET_HTTP: &str = "System.Net.Http";
 const MEGABYTE_COUNTERS: &[&str] =
     &["working-set", "gc-heap-size", "gc-committed", "gen-0-gc-budget"];
 
+/// Collections per interval, youngest generation first.
+///
+/// Increment counters: each reading is how many collections happened during that interval, which
+/// is what a timeline of GC activity wants. The panel that reports them as rates instead reads
+/// zero on anything but a busy process.
+pub const GC_COUNT_COUNTERS: &[&str] = &["gen-0-gc-count", "gen-1-gc-count", "gen-2-gc-count"];
+
 /// The generation sizes, largest-lived first, as they should appear in the GC panel.
 pub const GENERATION_COUNTERS: &[&str] =
     &["gen-0-size", "gen-1-size", "gen-2-size", "loh-size", "poh-size"];

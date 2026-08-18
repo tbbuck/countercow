@@ -279,6 +279,24 @@ fn the_charts_annotate_their_scale_and_span() {
 }
 
 #[test]
+fn a_wide_terminal_gets_the_gc_timeline_beside_the_heap_chart() {
+    let output = render(&app_from(ASPNET), 140, 40);
+    assert!(output.contains("GC activity"), "the GC chart should appear");
+    for generation in ["gen 0", "gen 1", "gen 2"] {
+        assert!(output.contains(generation), "{generation} missing from the chart legend");
+    }
+    assert!(output.contains("Heap size"), "the heap chart keeps its place");
+}
+
+#[test]
+fn a_narrow_terminal_gives_the_whole_row_to_the_heap_chart() {
+    // Two charts sharing 60-odd columns would leave neither wide enough to show a shape.
+    let output = render(&app_from(ASPNET), 80, 40);
+    assert!(output.contains("Heap size"));
+    assert!(!output.contains("gen 0 "), "no chart legend at this width");
+}
+
+#[test]
 fn an_app_with_no_samples_shows_placeholders_not_an_empty_screen() {
     let process = DotnetProcess {
         pid: 1,

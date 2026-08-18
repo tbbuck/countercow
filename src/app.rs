@@ -199,7 +199,12 @@ impl App {
     /// Record a sample. Pausing freezes the graphs but keeps the session running, so history is
     /// continuous when you unpause rather than showing a misleading gap.
     pub fn record(&mut self, sample: CounterSample) {
-        let now = Instant::now();
+        self.record_at(sample, Instant::now());
+    }
+
+    /// [`Self::record`] with the arrival time supplied, for replaying a capture at the cadence it
+    /// was gathered at rather than as fast as it parses.
+    pub fn record_at(&mut self, sample: CounterSample, now: Instant) {
         self.status = Status::Live;
         self.samples_seen += 1;
         self.last_sample_at = Some(now);

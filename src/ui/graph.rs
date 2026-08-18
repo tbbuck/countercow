@@ -165,6 +165,127 @@ impl Graph<'_> {
     }
 }
 
+/// One series of a [`Stacked`] plot, drawn on top of the bands before it.
+pub struct Band<'a> {
+    /// Oldest first, the same length as every other band in the plot.
+    pub values: &'a [f64],
+    pub color: Color,
+}
+
+/// Several series stacked into one plot, newest sample at the right edge.
+///
+/// Unlike [`Graph`] the colour carries the series rather than the height, because that is the
+/// question here: which generation collected, not how far up the plot it reached. A cell takes the
+/// colour of the highest band present in it, so a boundary between two bands lands on a cell edge
+/// rather than inside one — braille packs two samples into a cell and there is no way to colour
+/// half of one.
+pub struct Stacked<'a> {
+    /// Bottom band first.
+    pub bands: &'a [Band<'a>],
+    /// Full-scale value for the summed stack.
+    pub max: f64,
+    pub plot: Plot,
+}
+
+impl Stacked<'_> {
+    pub fn render(&self, buf: &mut Buffer, area: Rect) {
+        if area.width == 0 || area.height == 0 || self.max <= 0.0 || self.bands.is_empty() {
+            return;
+        }
+
+        let rows_per_cell = self.plot.rows_per_cell();
+        let columns = Graph::capacity(self.plot, area.width);
+        let sub_rows = area.height as usize * rows_per_cell;
+
+        // Cumulative sub-row height per band, per sub-column: tops[column][band] is where that
+        // band ends, so the band owning a given height is the first one that reaches it.
+        let mut tops = vec![vec![0usize; self.bands.len()]; columns];
+        for (index, band) in self.bands.iter().enumerate() {
+            let recent = &band.values[band.values.len().saturating_sub(columns)..];
+            let offset = columns - recent.len();
+            for (position, value) in recent.iter().enumerate() {
+                let column = &mut tops[offset + position];
+                let below = if index == 0 { 0 } else { column[index - 1] };
+                let height = if value.is_finite() && *value > 0.0 {
+                    ((value / self.max * sub_rows as f64).round() as usize).max(1)
+                } else {
+                    0
+                };
+                column[index] = (below + height).min(sub_rows);
+            }
+        }
+
+        for cell_y in 0..area.height {
+            for cell_x in 0..area.width {
+                let Some((symbol, band)) =
+                    self.cell(&tops, sub_rows, rows_per_cell, cell_x, cell_y)
+                else {
+                    continue;
+                };
+                buf[(area.x + cell_x, area.y + cell_y)]
+                    .set_char(symbol)
+                    .set_style(Style::default().fg(self.bands[band].color));
+            }
+        }
+    }
+
+    /// The glyph for one cell and the band that should colour it.
+    fn cell(
+        &self,
+        tops: &[Vec<usize>],
+        sub_rows: usize,
+        rows_per_cell: usize,
+        cell_x: u16,
+        cell_y: u16,
+    ) -> Option<(char, usize)> {
+        let total = |column: usize| tops[column].last().copied().unwrap_or(0);
+        // The band that owns the highest filled sub-row in this cell is the one that colours it.
+        let mut highest = 0usize;
+        let mut owner = 0usize;
+
+        let symbol = if self.plot == Plot::Block {
+            let column = cell_x as usize;
+            let base = sub_rows - (cell_y as usize + 1) * rows_per_cell;
+            let eighths = total(column).saturating_sub(base).min(8);
+            if eighths == 0 {
+                return None;
+            }
+            highest = base + eighths;
+            owner = self.owner(&tops[column], highest);
+            EIGHTHS[eighths]
+        } else {
+            let mut pattern = 0usize;
+            for row in 0..rows_per_cell {
+                let from_bottom = sub_rows - (cell_y as usize * rows_per_cell + row);
+                for offset in 0..2 {
+                    let column = cell_x as usize * 2 + offset;
+                    if total(column) >= from_bottom {
+                        pattern |= 1 << (row * 2 + offset);
+                        if from_bottom > highest {
+                            highest = from_bottom;
+                            owner = self.owner(&tops[column], from_bottom);
+                        }
+                    }
+                }
+            }
+            if pattern == 0 {
+                return None;
+            }
+            match self.plot {
+                Plot::Octant => pixel::OCTANTS[pattern],
+                _ => braille::BRAILLE[pattern],
+            }
+        };
+
+        Some((symbol, owner))
+    }
+
+    /// The band a given height belongs to.
+    fn owner(&self, tops: &[usize], height: usize) -> usize {
+        tops.iter().position(|&top| height <= top).unwrap_or(tops.len() - 1)
+    }
+}
+
 /// One value as a chunky vertical bar filling `area`, coloured by height like a [`Graph`].
 ///
 /// `track` shades the unfilled remainder. Bars in a group share a scale, so a small one is a
@@ -360,6 +481,65 @@ mod tests {
         let mut buf = Buffer::empty(Rect::new(0, 0, 10, 10));
         graph(&[1.0], 1.0, Plot::Braille).render(&mut buf, Rect::new(0, 0, 0, 5));
         graph(&[1.0], 1.0, Plot::Braille).render(&mut buf, Rect::new(0, 0, 5, 0));
+    }
+
+    /// Render a stack and return each row as (symbols, distinct colours left to right).
+    fn stack(bands: &[(&[f64], Color)], max: f64, width: u16, height: u16) -> Vec<(String, Vec<Color>)> {
+        let area = Rect::new(0, 0, width, height);
+        let mut buf = Buffer::empty(area);
+        let bands: Vec<Band> = bands.iter().map(|(values, color)| Band { values, color: *color }).collect();
+        Stacked { bands: &bands, max, plot: Plot::Block }.render(&mut buf, area);
+
+        (0..height)
+            .map(|y| {
+                let symbols: String = (0..width).map(|x| buf[(x, y)].symbol()).collect();
+                let colours = (0..width).map(|x| buf[(x, y)].fg).collect();
+                (symbols, colours)
+            })
+            .collect()
+    }
+
+    #[test]
+    fn bands_stack_bottom_first_and_keep_their_own_colours() {
+        // Two units of red under two of blue, on a four-unit scale: each fills half the plot.
+        let rows = stack(&[(&[2.0; 4], Color::Red), (&[2.0; 4], Color::Blue)], 4.0, 4, 2);
+        assert_eq!(rows[0].0, "████", "the upper band");
+        assert_eq!(rows[1].0, "████", "the lower band");
+        assert!(rows[0].1.iter().all(|c| *c == Color::Blue), "{:?}", rows[0].1);
+        assert!(rows[1].1.iter().all(|c| *c == Color::Red), "{:?}", rows[1].1);
+    }
+
+    #[test]
+    fn a_band_that_is_all_zero_takes_no_room() {
+        let rows = stack(&[(&[4.0; 2], Color::Red), (&[0.0; 2], Color::Blue)], 4.0, 2, 2);
+        assert!(rows.iter().all(|(_, colours)| colours.iter().all(|c| *c == Color::Red)));
+    }
+
+    #[test]
+    fn an_empty_stack_draws_nothing() {
+        let rows = stack(&[(&[0.0; 4], Color::Red), (&[0.0; 4], Color::Blue)], 4.0, 4, 2);
+        assert!(rows.iter().all(|(symbols, _)| symbols.trim().is_empty()), "{rows:?}");
+    }
+
+    #[test]
+    fn a_stack_is_anchored_to_the_right_like_a_graph() {
+        let rows = stack(&[(&[4.0, 4.0], Color::Red)], 4.0, 4, 1);
+        assert_eq!(rows[0].0, "  ██");
+    }
+
+    #[test]
+    fn a_stack_clamps_rather_than_overflowing_its_area() {
+        let rows = stack(&[(&[99.0; 2], Color::Red), (&[99.0; 2], Color::Blue)], 4.0, 2, 2);
+        assert!(rows.iter().all(|(symbols, _)| symbols == "██"), "{rows:?}");
+    }
+
+    #[test]
+    fn a_degenerate_stack_is_survivable() {
+        let mut buf = Buffer::empty(Rect::new(0, 0, 10, 10));
+        let bands = [Band { values: &[1.0], color: Color::Red }];
+        Stacked { bands: &bands, max: 1.0, plot: Plot::Braille }.render(&mut buf, Rect::new(0, 0, 0, 4));
+        Stacked { bands: &[], max: 1.0, plot: Plot::Braille }.render(&mut buf, Rect::new(0, 0, 4, 4));
+        Stacked { bands: &bands, max: 0.0, plot: Plot::Braille }.render(&mut buf, Rect::new(0, 0, 4, 4));
     }
 
     #[test]

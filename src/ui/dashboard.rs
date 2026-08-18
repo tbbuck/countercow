@@ -10,6 +10,7 @@ use crate::app::{format_uptime, App, Reading, Status};
 use crate::counters::catalog;
 
 use super::chart::{self, Scale, TimeSeries};
+use super::graph;
 use super::panels;
 use super::theme::Theme;
 
@@ -169,6 +170,10 @@ fn format_interval(seconds: f64) -> String {
 const BARS_HEIGHT: u16 = 9;
 /// Smallest chart that still conveys a trend.
 const MIN_CHART_HEIGHT: u16 = 6;
+/// Width below which a chart is too cramped to be worth splitting the row for.
+const MIN_CHART_WIDTH: u16 = 34;
+/// Collections per interval that fill the GC chart, however quiet the process is.
+const GC_CHART_FLOOR: f64 = 4.0;
 
 /// GC and memory, which gets the most space on both layouts.
 fn render_gc_section(frame: &mut Frame, area: Rect, app: &App, theme: &Theme) {
@@ -188,13 +193,27 @@ fn render_gc_section(frame: &mut Frame, area: Rect, app: &App, theme: &Theme) {
     let [top, bottom] =
         Layout::vertical([Constraint::Fill(1), Constraint::Length(BARS_HEIGHT)]).areas(area);
 
-    let [chart_area, memory_area] =
-        Layout::horizontal([Constraint::Fill(1), Constraint::Length(stats_width)]).areas(top);
     let [bars_area, activity_area] =
         Layout::horizontal([Constraint::Fill(1), Constraint::Length(stats_width)]).areas(bottom);
 
-    render_bytes_chart(frame, chart_area, app, theme, "Heap size", "gc-heap-size");
-    panels::stats(frame, memory_area, theme, "Memory", &panels::memory_rows(app));
+    // The GC chart only earns its place once both charts still have room to show a shape; below
+    // that the heap trend is the more useful of the two and keeps the whole width.
+    if top.width >= stats_width + MIN_CHART_WIDTH * 2 {
+        let [chart_area, gc_area, memory_area] = Layout::horizontal([
+            Constraint::Fill(1),
+            Constraint::Fill(1),
+            Constraint::Length(stats_width),
+        ])
+        .areas(top);
+        render_bytes_chart(frame, chart_area, app, theme, "Heap size", "gc-heap-size");
+        render_gc_chart(frame, gc_area, app, theme);
+        panels::stats(frame, memory_area, theme, "Memory", &panels::memory_rows(app));
+    } else {
+        let [chart_area, memory_area] =
+            Layout::horizontal([Constraint::Fill(1), Constraint::Length(stats_width)]).areas(top);
+        render_bytes_chart(frame, chart_area, app, theme, "Heap size", "gc-heap-size");
+        panels::stats(frame, memory_area, theme, "Memory", &panels::memory_rows(app));
+    }
     panels::generation_bars(frame, bars_area, theme, app);
     panels::stats(frame, activity_area, theme, "GC activity", &panels::gc_activity_rows(app));
 }
@@ -296,6 +315,63 @@ fn render_runtime_section(
     if with_jit {
         panels::stats(frame, chunks[2], theme, "JIT", &panels::jit_rows(app));
     }
+}
+
+/// Collections per interval, stacked by generation.
+///
+/// The stats panel next door reports the same counters as rates, which on anything but a busy
+/// process reads zero most of the time and looks broken. Here a collection is a mark on a timeline
+/// in its generation's colour, so a quiet process is visibly quiet rather than apparently dead.
+fn render_gc_chart(frame: &mut Frame, area: Rect, app: &App, theme: &Theme) {
+    let labels = ["gen 0", "gen 1", "gen 2"];
+    let series: Vec<Vec<f64>> = catalog::GC_COUNT_COUNTERS
+        .iter()
+        .map(|counter| {
+            app.history(catalog::SYSTEM_RUNTIME, counter)
+                .iter()
+                .map(|reading| reading.value)
+                .collect()
+        })
+        .collect();
+
+    if series.iter().all(|values| values.is_empty()) {
+        chart::placeholder(frame, area, "GC activity", theme);
+        return;
+    }
+
+    // The generations report independently, so trim to the shortest before stacking: a band that
+    // is one sample longer than its neighbour would stack the wrong readings on top of each other.
+    let shortest = series.iter().map(Vec::len).min().unwrap_or(0);
+    // A floor on the scale, so one collection in a quiet window is a mark near the bottom rather
+    // than a full-height bar that reads as an emergency.
+    let peak = (0..shortest)
+        .map(|index| series.iter().map(|values| values[index]).sum::<f64>())
+        .fold(0.0, f64::max)
+        .max(GC_CHART_FLOOR);
+
+    let mut block = panels::titled_block("GC activity", theme);
+    for (index, label) in labels.iter().enumerate() {
+        let colour = theme.on(&theme.generation_gradient(index), 0.6);
+        block = block.title_bottom(Span::from(format!(" {label} ")).fg(colour));
+    }
+
+    let inner = block.inner(area);
+    frame.render_widget(block, area);
+    if inner.width == 0 || inner.height == 0 || peak <= 0.0 {
+        return;
+    }
+
+    let bands: Vec<graph::Band> = series
+        .iter()
+        .enumerate()
+        .map(|(index, values)| graph::Band {
+            values: &values[values.len() - shortest..],
+            color: theme.on(&theme.generation_gradient(index), 0.6),
+        })
+        .collect();
+
+    graph::Stacked { bands: &bands, max: peak, plot: theme.plot }
+        .render(frame.buffer_mut(), inner);
 }
 
 /// Chart a memory counter, scaling its history to bytes so the axis reads correctly whether the

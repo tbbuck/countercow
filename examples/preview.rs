@@ -101,6 +101,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             std::ops::ControlFlow::Continue(())
         })?;
     } else {
+        // Wound back far enough that the last reading lands about now.
+        let tick = std::time::Duration::from_millis(25);
+        let mut clock = std::time::Instant::now() - tick * 4000;
         for _ in 0..repeat {
             let mut parser = NettraceParser::new(std::io::Cursor::new(fixture))?;
             while let Some(batch) = parser.next_events()? {
@@ -109,7 +112,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                         continue;
                     };
                     if let Some(s) = sample::extract(metadata, &event)? {
-                        app.record(s);
+                        // Stamped as though the capture were arriving live, so the charts can
+                        // report a span rather than the microseconds the replay actually took.
+                        app.record_at(s, clock);
+                        clock += tick;
                     }
                 }
             }
