@@ -133,11 +133,7 @@ where
                 continue;
             };
 
-            // Another tool may be watching the same process at a different cadence; its payloads
-            // arrive on our session too. Ignore anything not on our interval.
-            if sample.interval_sec > 0.0
-                && (sample.interval_sec - interval_secs).abs() > interval_secs * 0.5
-            {
+            if !ours(sample.interval_sec, interval_secs) {
                 continue;
             }
 
@@ -148,9 +144,53 @@ where
     }
 }
 
+/// Whether a counter payload belongs to the session we asked for.
+///
+/// Another tool may be watching the same process at a different cadence; its payloads arrive on
+/// our session too, and at a faster cadence they would swamp ours. Anything clearly faster than we
+/// asked for is therefore rejected.
+///
+/// Nothing slower is, though a symmetric window would reject that too. The runtime stamps the
+/// interval it measured rather than the one it was asked for, so a payload arriving late is our
+/// own data from a process that was busy, not somebody else's arriving early — and discarding it
+/// leaves a panel reading as though the counter does not exist, which is a far more confusing
+/// failure than a duplicate point from a slower session.
+fn ours(reported_interval: f64, requested: f64) -> bool {
+    reported_interval <= 0.0 || reported_interval >= requested * 0.6
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_payload_at_the_rate_we_asked_for_is_ours() {
+        assert!(ours(1.0, 1.0));
+        assert!(ours(0.25, 0.25));
+    }
+
+    #[test]
+    fn a_late_payload_is_still_ours() {
+        // The runtime reports what it measured, and a busy process reports late. Dropping these
+        // is what leaves a counter looking as though it does not exist.
+        assert!(ours(1.4, 1.0));
+        assert!(ours(3.0, 1.0), "even a badly delayed one");
+    }
+
+    #[test]
+    fn a_faster_cadence_belongs_to_someone_else() {
+        // A second tool watching at 0.25s while we asked for 1s would otherwise deliver four
+        // times our sample rate into our history.
+        assert!(!ours(0.25, 1.0));
+        assert!(!ours(0.5, 1.0));
+    }
+
+    #[test]
+    fn an_unstamped_payload_is_kept() {
+        // The first payload of a session carries no interval; rejecting it would drop a counter's
+        // opening reading for no reason.
+        assert!(ours(0.0, 1.0));
+    }
 
     #[test]
     fn kestrel_provider_is_hyphenated_not_dotted() {

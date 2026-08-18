@@ -546,11 +546,14 @@ fn handle_key(app: &mut App, theme: &mut Theme, key: KeyEvent) {
     }
 
     match key.code {
-        KeyCode::Char('q') | KeyCode::Esc => app.exit = Some(Exit::Quit),
+        KeyCode::Char('q') => app.exit = Some(Exit::Quit),
         KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => {
             app.exit = Some(Exit::Quit);
         }
-        KeyCode::Char('d') => app.exit = Some(Exit::Detach),
+        // Escape is back everywhere else — out of the investigation, out of a profile — so from
+        // the dashboard it goes back to the picker rather than making this the one screen where
+        // it leaves the program.
+        KeyCode::Char('d') | KeyCode::Esc => app.exit = Some(Exit::Detach),
         KeyCode::Char('i') => app.toggle_investigate(),
         KeyCode::Char('c') => app.start_profile(),
         KeyCode::Char('p') | KeyCode::Char(' ') => app.paused = !app.paused,
@@ -586,12 +589,29 @@ mod tests {
     }
 
     #[test]
-    fn q_and_escape_quit() {
-        for code in [KeyCode::Char('q'), KeyCode::Esc] {
-            let mut app = app();
-            handle_key(&mut app, &mut Theme::default(), press(code));
-            assert_eq!(app.exit, Some(Exit::Quit), "{code:?} should quit");
-        }
+    fn q_quits_and_escape_goes_back() {
+        let mut quit = app();
+        handle_key(&mut quit, &mut Theme::default(), press(KeyCode::Char('q')));
+        assert_eq!(quit.exit, Some(Exit::Quit));
+
+        // Escape is back, not quit: it leaves the investigation and a profile the same way.
+        let mut back = app();
+        handle_key(&mut back, &mut Theme::default(), press(KeyCode::Esc));
+        assert_eq!(back.exit, Some(Exit::Detach));
+    }
+
+    #[test]
+    fn escape_backs_out_of_every_screen_rather_than_quitting() {
+        let mut app = app();
+        app.toggle_investigate();
+        handle_key(&mut app, &mut Theme::default(), press(KeyCode::Esc));
+        assert_eq!(app.view, View::Dashboard, "back to the dashboard");
+        assert_eq!(app.exit, None, "and still running");
+
+        app.start_profile();
+        handle_key(&mut app, &mut Theme::default(), press(KeyCode::Esc));
+        assert_eq!(app.view, View::Dashboard);
+        assert_eq!(app.exit, None);
     }
 
     #[test]

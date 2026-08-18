@@ -47,8 +47,8 @@ countercow ps              # list attachable processes and exit
 
 | Key | |
 |---|---|
-| `q` / `Esc` | quit |
-| `d` | detach and pick another process |
+| `q` | quit |
+| `d` / `Esc` | back: detach and pick another process |
 | `i` | investigate: allocations, GC causes, exceptions, contention |
 | `c` | CPU profile: which methods are burning time |
 | `p` | pause history (the session keeps running) |

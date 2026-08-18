@@ -124,19 +124,24 @@ impl TimeSeries<'_> {
 }
 
 /// Render a chart area that has no data yet, so the layout does not jump once data arrives.
-pub fn placeholder(frame: &mut Frame, area: Rect, title: &str, theme: &Theme) {
+///
+/// `note` says why it is empty when there is something better to say than "waiting". A chart with
+/// no data looks identical whether its provider has not reported yet or is never going to, and
+/// telling those apart from the outside is most of the work of diagnosing it.
+pub fn placeholder(frame: &mut Frame, area: Rect, title: &str, note: Option<&str>, theme: &Theme) {
     let block = titled_block(title, theme);
     let inner = block.inner(area);
     frame.render_widget(block, area);
+    if inner.height == 0 {
+        return;
+    }
 
-    let waiting = ratatui::widgets::Paragraph::new("waiting for data…")
-        .style(Style::default().fg(theme.dim))
+    let message = ratatui::widgets::Paragraph::new(note.unwrap_or("waiting for data…"))
+        .style(Style::default().fg(if note.is_some() { theme.warn } else { theme.dim }))
         .alignment(Alignment::Center);
     // Vertically centre the message in the block.
     let y = inner.y + inner.height / 2;
-    if inner.height > 0 {
-        frame.render_widget(waiting, Rect { y, height: 1, ..inner });
-    }
+    frame.render_widget(message, Rect { y, height: 1, ..inner });
 }
 
 /// Blocks that are not charts still want the same frame, so it lives with the chart code's

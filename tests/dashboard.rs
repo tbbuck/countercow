@@ -48,6 +48,22 @@ fn app_from(fixture: &[u8]) -> App {
     app
 }
 
+/// A Kestrel reading, so the session looks alive without System.Runtime having said anything.
+fn kestrel_sample() -> countercow::counters::sample::CounterSample {
+    use countercow::counters::sample::{CounterKind, CounterSample};
+    CounterSample {
+        provider: "Microsoft-AspNetCore-Server-Kestrel".into(),
+        name: "current-connections".into(),
+        display_name: "Current Connections".into(),
+        display_units: String::new(),
+        value: 17.0,
+        kind: CounterKind::Mean,
+        interval_sec: 1.0,
+        rate_time_scale: None,
+        timestamp: 0,
+    }
+}
+
 fn render(app: &App, width: u16, height: u16) -> String {
     render_with(app, width, height, Theme::default())
 }
@@ -294,6 +310,29 @@ fn a_narrow_terminal_gives_the_whole_row_to_the_heap_chart() {
     let output = render(&app_from(ASPNET), 80, 40);
     assert!(output.contains("Heap size"));
     assert!(!output.contains("gen 0 "), "no chart legend at this width");
+}
+
+#[test]
+fn an_empty_chart_names_the_provider_that_is_silent() {
+    // Counters arriving from one provider while another says nothing is a working session with a
+    // missing provider, not a session that has not started — and the two look identical without
+    // being told which it is.
+    let process = DotnetProcess {
+        pid: 1,
+        socket: "/tmp/s".into(),
+        name: "Quiet".into(),
+        command: "cmd".into(),
+        start_key_verified: true,
+    };
+    let mut app = App::new(process, ProcessInfo::default(), 1.0);
+    app.record(kestrel_sample());
+
+    let output = render(&app, 140, 40);
+    assert!(
+        output.contains("no System.Runtime counters"),
+        "should name the silent provider, not just say it is waiting"
+    );
+    assert!(!output.contains("waiting for data"), "there is a better answer than waiting");
 }
 
 #[test]

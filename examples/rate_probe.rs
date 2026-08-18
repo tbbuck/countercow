@@ -77,6 +77,14 @@ struct Run {
     counters: BTreeSet<String>,
     /// How many payloads carried each stamped interval, to the nearest 10 ms.
     stamps: BTreeMap<u64, usize>,
+    /// Per provider: how many payloads were kept, dropped, and the worst interval stamped.
+    /// Providers do not share a counter timer, so one can drift while the others do not.
+    providers: BTreeMap<String, (usize, usize, f64)>,
+    /// Events whose metadata never arrived, so nothing could be decoded from them. The session
+    /// skips these silently, which is exactly how a provider can go missing without a word.
+    unknown_metadata: BTreeMap<u32, usize>,
+    /// Events that decoded but carried no counter payload.
+    not_a_counter: usize,
 }
 
 impl Run {
@@ -93,6 +101,21 @@ impl Run {
             self.counters.len(),
             spread.join(", ")
         );
+        for (provider, (kept, dropped, worst)) in &self.providers {
+            println!("    {provider:<38} kept {kept:>5}  dropped {dropped:>5}  worst {worst:.2}s");
+        }
+        if !self.unknown_metadata.is_empty() {
+            let total: usize = self.unknown_metadata.values().sum();
+            println!(
+                "    {:<38} {total} events across {} metadata ids: {:?}",
+                "NO METADATA (silently skipped)",
+                self.unknown_metadata.len(),
+                self.unknown_metadata.keys().collect::<Vec<_>>()
+            );
+        }
+        if self.not_a_counter > 0 {
+            println!("    {:<38} {}", "decoded but not a counter payload", self.not_a_counter);
+        }
     }
 }
 
@@ -111,26 +134,33 @@ fn sample_at(
 
     'reading: while let Some(batch) = parser.next_events()? {
         for event in batch {
-            let Some(metadata) = parser.metadata().get(event.metadata_id) else {
-                continue;
-            };
-            let Some(sample) = sample::extract(metadata, &event)? else {
-                continue;
-            };
             if Instant::now() >= deadline {
                 break 'reading;
             }
+            let Some(metadata) = parser.metadata().get(event.metadata_id) else {
+                *run.unknown_metadata.entry(event.metadata_id).or_default() += 1;
+                continue;
+            };
+            let Some(sample) = sample::extract(metadata, &event)? else {
+                run.not_a_counter += 1;
+                continue;
+            };
 
             run.counters.insert(format!("{}/{}", sample.provider, sample.name));
             *run.stamps.entry((sample.interval_sec * 100.0).round() as u64 * 10).or_default() += 1;
+
+            let tally = run.providers.entry(sample.provider.clone()).or_default();
+            tally.2 = tally.2.max(sample.interval_sec);
 
             // The rule the dashboard applies, evaluated here so its cost shows up in the output
             // rather than silently shrinking the sample count.
             if sample.interval_sec > 0.0 && (sample.interval_sec - interval).abs() > interval * 0.5
             {
                 run.dropped += 1;
+                tally.1 += 1;
             } else {
                 run.kept += 1;
+                tally.0 += 1;
             }
         }
     }

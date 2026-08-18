@@ -132,7 +132,7 @@ fn render_footer(frame: &mut Frame, area: Rect, app: &App, theme: &Theme) {
         ("?", "help".to_owned()),
         ("i", "investigate".to_owned()),
         ("c", "cpu".to_owned()),
-        ("d", "detach".to_owned()),
+        ("d / Esc", "back".to_owned()),
         ("p", "pause".to_owned()),
         ("m", theme.plot_name().to_owned()),
     ];
@@ -239,7 +239,8 @@ fn render_aspnet_body(frame: &mut Frame, area: Rect, app: &App, theme: &Theme) {
 
     let rps = app.history(catalog::ASPNET_HOSTING, "requests-per-second");
     if rps.is_empty() {
-        chart::placeholder(frame, rps_area, "Requests/sec", theme);
+        let note = silent_provider(app, catalog::ASPNET_HOSTING);
+        chart::placeholder(frame, rps_area, "Requests/sec", note.as_deref(), theme);
     } else {
         TimeSeries {
             title: "Requests/sec",
@@ -290,7 +291,8 @@ fn render_runtime_section(
 
     let cpu = app.history(catalog::SYSTEM_RUNTIME, "cpu-usage");
     if cpu.is_empty() {
-        chart::placeholder(frame, cpu_chart_area, "CPU usage", theme);
+        let note = silent_provider(app, catalog::SYSTEM_RUNTIME);
+        chart::placeholder(frame, cpu_chart_area, "CPU usage", note.as_deref(), theme);
     } else {
         TimeSeries {
             title: "CPU usage",
@@ -317,6 +319,16 @@ fn render_runtime_section(
     }
 }
 
+/// Why a chart is empty, when the reason is more useful than "waiting".
+///
+/// Counters arriving from other providers while this one has said nothing means the session is
+/// healthy and this provider specifically is silent — which is the fact worth putting on screen,
+/// because the two cases look identical otherwise.
+fn silent_provider(app: &App, provider: &str) -> Option<String> {
+    (!app.has_provider(provider) && app.counter_count() > 0)
+        .then(|| format!("no {provider} counters"))
+}
+
 /// Collections per interval, stacked by generation.
 ///
 /// The stats panel next door reports the same counters as rates, which on anything but a busy
@@ -335,7 +347,8 @@ fn render_gc_chart(frame: &mut Frame, area: Rect, app: &App, theme: &Theme) {
         .collect();
 
     if series.iter().all(|values| values.is_empty()) {
-        chart::placeholder(frame, area, "GC activity", theme);
+        let note = silent_provider(app, catalog::SYSTEM_RUNTIME);
+        chart::placeholder(frame, area, "GC activity", note.as_deref(), theme);
         return;
     }
 
@@ -386,7 +399,8 @@ fn render_bytes_chart(
 ) {
     let history = app.history(catalog::SYSTEM_RUNTIME, counter);
     if history.is_empty() {
-        chart::placeholder(frame, area, title, theme);
+        let note = silent_provider(app, catalog::SYSTEM_RUNTIME);
+        chart::placeholder(frame, area, title, note.as_deref(), theme);
         return;
     }
 
@@ -413,8 +427,8 @@ fn render_help(frame: &mut Frame, area: Rect, theme: &Theme) {
     let lines = vec![
         Line::from(Span::from("countercow").fg(theme.accent).bold()),
         Line::from(""),
-        Line::from("  q / Esc   quit"),
-        Line::from("  d         detach and pick another process"),
+        Line::from("  q         quit"),
+        Line::from("  d / Esc   back: detach and pick another process"),
         Line::from("  i         investigate: allocations, GC causes, exceptions"),
         Line::from("  c         cpu profile: which methods are burning time"),
         Line::from("  p         pause history (session keeps running)"),
